@@ -5,8 +5,8 @@
 <key>CFBundleName</key><string>ApexTunePowerReader</string>
 <key>CFBundleExecutable</key><string>ApexTunePowerReader</string>
 <key>CFBundlePackageType</key><string>KEXT</string>
-<key>CFBundleVersion</key><string>1.0.0</string>
-<key>CFBundleShortVersionString</key><string>1.0.0</string>
+<key>CFBundleVersion</key><string>2.0.0</string>
+<key>CFBundleShortVersionString</key><string>2.0.0</string>
 <key>OSBundleRequired</key><string>Root</string>
 <key>OSBundleLibraries</key><dict>
   <key>com.apple.kpi.bsd</key><string>20.0.0</string>
