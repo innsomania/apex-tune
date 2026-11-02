@@ -3,9 +3,11 @@ SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 BUILD := build
 BUNDLE := $(BUILD)/ApexTunePowerReader.kext
 KERNEL_HEADERS := $(SDK)/System/Library/Frameworks/Kernel.framework/Headers
-CXXFLAGS := -std=c++17 -Wall -Wextra -Werror -O2 -isysroot $(SDK)
+CXXFLAGS := -std=c++17 -Wall -Wextra -Werror -O2 -mmacosx-version-min=15.0 -isysroot $(SDK)
 KEXTFLAGS := -arch x86_64 -mkernel -fapple-kext -fno-exceptions -fno-rtti \
-	-fno-stack-protector -fno-builtin -nostdlib -isysroot $(SDK) -I$(KERNEL_HEADERS)
+	-fno-stack-protector -fno-builtin -nostdlib -mmacosx-version-min=15.0 -isysroot $(SDK) -I$(KERNEL_HEADERS)
+KEXT_CFLAGS := -arch x86_64 -mkernel -fno-stack-protector -fno-builtin \
+	-nostdlib -mmacosx-version-min=15.0 -isysroot $(SDK) -I$(KERNEL_HEADERS)
 
 .PHONY: all test clean kext
 all: $(BUILD)/apextune-power-probe kext
@@ -30,13 +32,19 @@ kext: $(BUNDLE)/Contents/MacOS/ApexTunePowerReader
 $(BUILD)/ApexTunePowerReader.o: ApexTunePowerReader.cpp power_snapshot.h | $(BUILD)
 	xcrun clang++ $(KEXTFLAGS) -c $< -o $@
 
-$(BUILD)/kmod.o: kmod.cpp | $(BUILD)
-	xcrun clang++ $(KEXTFLAGS) -c $< -o $@
+$(BUILD)/kmod_info.o: kmod_info.c | $(BUILD)
+	xcrun clang $(KEXT_CFLAGS) -c $< -o $@
 
-$(BUNDLE)/Contents/MacOS/ApexTunePowerReader: $(BUILD)/ApexTunePowerReader.o $(BUILD)/kmod.o Info.plist
+$(BUILD)/c_start.o: c_start.c | $(BUILD)
+	xcrun clang $(KEXT_CFLAGS) -c $< -o $@
+
+$(BUILD)/c_stop.o: c_stop.c | $(BUILD)
+	xcrun clang $(KEXT_CFLAGS) -c $< -o $@
+
+$(BUNDLE)/Contents/MacOS/ApexTunePowerReader: $(BUILD)/ApexTunePowerReader.o $(BUILD)/kmod_info.o $(BUILD)/c_start.o $(BUILD)/c_stop.o Info.plist
 	mkdir -p $(BUNDLE)/Contents/MacOS
 	xcrun clang++ $(KEXTFLAGS) -Wl,-kext -Wl,-undefined,dynamic_lookup \
-	  $(BUILD)/ApexTunePowerReader.o $(BUILD)/kmod.o -L$(SDK)/usr/lib -lkmod -o $@
+	  $(BUILD)/ApexTunePowerReader.o $(BUILD)/kmod_info.o $(BUILD)/c_start.o $(BUILD)/c_stop.o -o $@
 	cp Info.plist $(BUNDLE)/Contents/Info.plist
 
 clean:

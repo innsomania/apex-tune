@@ -6,7 +6,7 @@ The reported PL1/PL2 values are package-average power limits encoded by the CPU.
 
 ## Build and offline checks
 
-Run `make test` to compile the CLI, run deterministic decoding fixtures, and verify that a missing live driver returns an error rather than fake data. Run `make kext` to compile and link an unsigned x86_64 `.kext` bundle against the installed macOS kernel headers. The bundle is assembled locally but is not signed, installed, or loaded; package creation alone does not validate loadability. No driver is auto-loaded.
+Run `make test` to compile the CLI, run deterministic decoding fixtures, and verify that a missing live driver returns an error rather than fake data. All user-space and kernel objects are explicitly compiled for macOS 15. Run `make kext` to compile and link an unsigned x86_64 `.kext` bundle against the installed macOS kernel headers. The bundle uses Apple XNU `_start`/`_stop` glue compiled from the APSL-licensed sources noted in `APPLE_XNU_PROVENANCE.md`. The bundle is assembled locally but is not signed, installed, or loaded; package creation alone does not validate loadability. No driver is auto-loaded.
 
 Build requires Xcode command-line tools. A live reading requires a separately packaged/authorized/loaded kext. This repository task does not install or load it and does not modify SIP. Runtime hardware access, privilege flow, Sequoia compatibility, and actual PL1/PL2 readback remain unverified.
 
