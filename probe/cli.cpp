@@ -7,6 +7,7 @@
 #include <cstring>
 #include <iostream>
 #include <poll.h>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 
@@ -47,13 +48,13 @@ static bool readSnapshot(io_connect_t connection, apt_power_snapshot *snapshot) 
     kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_SNAPSHOT,
                                                       nullptr, 0, snapshot, &output_size);
     if (status != KERN_SUCCESS || output_size != sizeof(*snapshot)) {
-        std::fprintf(stderr, "Power snapshot failed (0x%x); the loaded reader may not use protocol v3.\n", status);
+        std::fprintf(stderr, "Power snapshot failed (0x%x); the loaded reader may not use protocol v4.\n", status);
         return false;
     }
     apt_decoded_power decoded{};
     if (!apt_decode_power(snapshot, &decoded) ||
         snapshot->undervolt_lock_status != APT_UNDERVOLT_LOCK_UNKNOWN) {
-        std::fprintf(stderr, "Incompatible or invalid protocol v3 snapshot.\n");
+        std::fprintf(stderr, "Incompatible or invalid protocol v4 snapshot.\n");
         return false;
     }
     return true;
@@ -63,7 +64,7 @@ static void printLimit(const char *label, uint64_t raw, uint64_t unitMSR) {
     const double watt_unit = 1.0 / static_cast<double>(1ULL << (unitMSR & 0x0f));
     const uint64_t pl1 = raw & APT_PL1_POWER_MASK;
     const uint64_t pl2 = (raw & APT_PL2_POWER_MASK) >> 32;
-    std::printf("%s PL1 %.2f W, PL2 %.2f W\n", label,
+    std::printf("%s PL1 %.3f W, PL2 %.3f W\n", label,
                 static_cast<double>(pl1) * watt_unit,
                 static_cast<double>(pl2) * watt_unit);
 }
@@ -95,22 +96,25 @@ static bool beginSession(io_connect_t connection, apt_session_result *result) {
     return true;
 }
 
-static bool setProfile(io_connect_t connection, uint32_t pl1, uint32_t tier,
+static bool setProfile(io_connect_t connection, uint32_t pl1HalfWatts, uint32_t tier,
+                       uint32_t pl2HalfWatts,
                        apt_session_result *result) {
     uint32_t maximum_pl2 = 0;
-    if (!apt_profile_pl2(pl1, tier, APT_PROFILE_MAX_WATTS, &maximum_pl2)) return false;
+    if (!apt_profile_pl2(pl1HalfWatts, tier, APT_PROFILE_MAX_HALF_WATTS, &maximum_pl2) ||
+        pl2HalfWatts < pl1HalfWatts || pl2HalfWatts > maximum_pl2) return false;
     apt_profile_request request{};
     request.magic = APT_POWER_MAGIC;
     request.version = APT_POWER_VERSION;
     request.size = sizeof(request);
-    request.pl1_watts = pl1;
+    request.pl1_half_watts = pl1HalfWatts;
+    request.pl2_half_watts = pl2HalfWatts;
     request.turbo_tier = tier;
     size_t output_size = sizeof(*result);
     kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_SET_PROFILE,
                                                       &request, sizeof(request), result, &output_size);
     if (status != KERN_SUCCESS || output_size != sizeof(*result) || !validSessionResult(*result) ||
-        !result->active || result->pl1_watts != pl1 || result->turbo_tier != tier ||
-        result->pl2_watts < pl1 || result->pl2_watts > maximum_pl2) {
+        !result->active || result->pl1_half_watts != pl1HalfWatts || result->turbo_tier != tier ||
+        result->pl2_half_watts != pl2HalfWatts) {
         std::fprintf(stderr, "Profile update refused or failed (0x%x).\n", status);
         return false;
     }
@@ -140,16 +144,18 @@ static bool finishSession(io_connect_t connection, apt_session_result *result) {
     return !result->active && apt_power_fields_equal(result->current_raw, result->original_raw);
 }
 
-static bool validTrial(uint32_t pl1, uint32_t tier, uint32_t seconds) {
+static bool validTrial(uint32_t pl1HalfWatts, uint32_t tier, uint32_t seconds) {
     uint32_t pl2 = 0;
-    return apt_profile_pl2(pl1, tier, APT_PROFILE_MAX_WATTS, &pl2) && seconds > 0 && seconds <= 20;
+    return apt_profile_pl2(pl1HalfWatts, tier, APT_PROFILE_MAX_HALF_WATTS, &pl2) && seconds > 0 && seconds <= 20;
 }
 
-static int runTrial(uint32_t pl1, uint32_t tier, uint32_t seconds) {
-    if (!validTrial(pl1, tier, seconds)) {
-        std::fprintf(stderr, "Trial requires PL1 10..80 W in 5 W steps, tier 1..5, duration 1..20s.\n");
+static int runTrial(uint32_t pl1HalfWatts, uint32_t tier, uint32_t seconds) {
+    uint32_t pl2HalfWatts = 0;
+    if (!validTrial(pl1HalfWatts, tier, seconds)) {
+        std::fprintf(stderr, "Trial requires PL1 10..80 W in 0.5 W steps, tier 1..5, duration 1..20s.\n");
         return 64;
     }
+    if (!apt_profile_pl2(pl1HalfWatts, tier, APT_PROFILE_MAX_HALF_WATTS, &pl2HalfWatts)) return 64;
     if (geteuid() != 0) {
         std::fprintf(stderr, "Power profile changes require administrator privileges; run with sudo.\n");
         return 77;
@@ -164,7 +170,7 @@ static int runTrial(uint32_t pl1, uint32_t tier, uint32_t seconds) {
         return 65;
     }
     printLimit("Before:", state.original_raw, before.power_unit_msr);
-    if (!setProfile(connection, pl1, tier, &state)) {
+    if (!setProfile(connection, pl1HalfWatts, tier, pl2HalfWatts, &state)) {
         apt_session_result ignored{};
         finishSession(connection, &ignored);
         IOServiceClose(connection);
@@ -194,6 +200,26 @@ static int runTrial(uint32_t pl1, uint32_t tier, uint32_t seconds) {
     return exit_code;
 }
 
+static bool parseProfileCommand(const std::string &line, uint32_t *pl1HalfWatts,
+                                uint32_t *tier, uint32_t *pl2HalfWatts) {
+    if (!pl1HalfWatts || !tier || !pl2HalfWatts) return false;
+    std::istringstream command(line);
+    std::string verb, pl1Text, tierText, pl2Text, extra;
+    if (!(command >> verb >> pl1Text >> tierText) || verb != "set" ||
+        !apt_parse_half_watts(pl1Text.c_str(), pl1HalfWatts) ||
+        !parseUnsigned(tierText.c_str(), tier)) return false;
+    uint32_t maximumPL2 = 0;
+    if (!apt_profile_pl2(*pl1HalfWatts, *tier, APT_PROFILE_MAX_HALF_WATTS, &maximumPL2)) return false;
+    const bool hasExplicitPL2 = static_cast<bool>(command >> pl2Text);
+    if (command >> extra) return false;
+    if (hasExplicitPL2) {
+        return apt_parse_half_watts(pl2Text.c_str(), pl2HalfWatts) &&
+               *pl2HalfWatts >= *pl1HalfWatts && *pl2HalfWatts <= maximumPL2;
+    }
+    *pl2HalfWatts = maximumPL2;
+    return true;
+}
+
 static bool processControllerCommand(io_connect_t connection, const std::string &line,
                                      uint64_t unitMSR, bool *finished) {
     *finished = false;
@@ -210,21 +236,21 @@ static bool processControllerCommand(io_connect_t connection, const std::string 
         *finished = true;
         return restored;
     }
-    uint32_t pl1 = 0, tier = 0;
-    char extra = 0;
-    if (std::sscanf(line.c_str(), "set %u %u %c", &pl1, &tier, &extra) == 2) {
-        uint32_t pl2 = 0;
-        if (!apt_profile_pl2(pl1, tier, APT_PROFILE_MAX_WATTS, &pl2)) {
-            std::fprintf(stderr, "Invalid profile; PL1 must be 10..80 W in 5 W steps and tier 1..5.\n");
+    uint32_t pl1HalfWatts = 0, tier = 0, pl2HalfWatts = 0;
+    if (parseProfileCommand(line, &pl1HalfWatts, &tier, &pl2HalfWatts)) {
+        uint32_t maximumPL2 = 0;
+        if (!apt_profile_pl2(pl1HalfWatts, tier, APT_PROFILE_MAX_HALF_WATTS, &maximumPL2) ||
+            pl2HalfWatts < pl1HalfWatts || pl2HalfWatts > maximumPL2) {
+            std::fprintf(stderr, "Invalid profile; PL1 must be 10..80 W in 0.5 W steps and tier 1..5.\n");
             return false;
         }
         apt_session_result result{};
-        if (!setProfile(connection, pl1, tier, &result)) return false;
+        if (!setProfile(connection, pl1HalfWatts, tier, pl2HalfWatts, &result)) return false;
         printLimit("Applied readback:", result.current_raw, unitMSR);
-        std::printf("Turbo power budget tier %u; PL2 target %u W.\n", tier, pl2);
+        std::printf("Turbo power budget tier %u; PL2 target %.1f W.\n", tier, pl2HalfWatts / 2.0);
         return true;
     }
-    std::fprintf(stderr, "Commands: status | set <PL1-W> <tier-1..5> | finish\n");
+    std::fprintf(stderr, "Commands: status | set <PL1-W-in-0.5-W-steps> <tier-1..5> | finish\n");
     return false;
 }
 
@@ -242,7 +268,7 @@ static int runController() {
         return 65;
     }
     printSnapshot(snapshot);
-    std::printf("Session active; profiles renew a 30-second lease. Type status, set <PL1-W> <tier>, or finish.\n");
+    std::printf("Session active; profiles renew a 30-second lease. Type status, set <PL1-W-in-0.5-W-steps> <tier>, or finish.\n");
     std::string pending;
     bool finished = false;
     int exit_code = 0;
@@ -321,10 +347,10 @@ static double wattsFromRaw(uint64_t raw, uint64_t unitMSR, uint64_t mask, unsign
 
 static void emitMachineState(const char *event, const apt_session_result &state,
                              uint64_t unitMSR, bool active) {
-    std::printf("{\"event\":\"%s\",\"active\":%s,\"pl1_watts\":%u,\"pl2_watts\":%u,"
+    std::printf("{\"event\":\"%s\",\"active\":%s,\"pl1_watts\":%.1f,\"pl2_watts\":%.1f,"
                 "\"tier\":%u,\"actual_pl1_watts\":%.3f,\"actual_pl2_watts\":%.3f,"
                 "\"original_pl1_watts\":%.3f,\"original_pl2_watts\":%.3f}\n",
-                event, active ? "true" : "false", state.pl1_watts, state.pl2_watts,
+                event, active ? "true" : "false", state.pl1_half_watts / 2.0, state.pl2_half_watts / 2.0,
                 state.turbo_tier,
                 wattsFromRaw(state.current_raw, unitMSR, APT_PL1_POWER_MASK, 0),
                 wattsFromRaw(state.current_raw, unitMSR, APT_PL2_POWER_MASK, 32),
@@ -366,14 +392,15 @@ static int runMachineController() {
             if (!ok) exit_code = 70;
             finished = true;
         } else {
-            uint32_t pl1 = 0, tier = 0;
-            char extra = 0;
-            if (std::sscanf(line.c_str(), "set %u %u %c", &pl1, &tier, &extra) != 2) {
+            uint32_t pl1HalfWatts = 0, tier = 0, pl2HalfWatts = 0;
+            if (!parseProfileCommand(line, &pl1HalfWatts, &tier, &pl2HalfWatts) ||
+                !apt_is_profile_pl1(pl1HalfWatts) || pl2HalfWatts < pl1HalfWatts ||
+                pl2HalfWatts > APT_PROFILE_MAX_HALF_WATTS) {
                 std::printf("{\"event\":\"error\",\"message\":\"invalid command\"}\n");
                 std::fflush(stdout);
                 continue;
             }
-            if (!setProfile(connection, pl1, tier, &state)) {
+            if (!setProfile(connection, pl1HalfWatts, tier, pl2HalfWatts, &state)) {
                 std::printf("{\"event\":\"error\",\"message\":\"profile refused\"}\n");
                 std::fflush(stdout);
                 apt_session_result restored{};
@@ -413,14 +440,14 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::strcmp(argv[1], "controller") == 0 &&
         std::strcmp(argv[2], "--machine") == 0) return runMachineController();
     if (argc == 5 && std::strcmp(argv[1], "trial") == 0) {
-        uint32_t pl1 = 0, tier = 0, seconds = 0;
-        if (!parseUnsigned(argv[2], &pl1) || !parseUnsigned(argv[3], &tier) ||
+        uint32_t pl1HalfWatts = 0, tier = 0, seconds = 0;
+        if (!apt_parse_half_watts(argv[2], &pl1HalfWatts) || !parseUnsigned(argv[3], &tier) ||
             !parseUnsigned(argv[4], &seconds)) {
-            std::fprintf(stderr, "Usage: apextune-power-probe trial <PL1-W> <tier-1..5> <seconds>\n");
+            std::fprintf(stderr, "Usage: apextune-power-probe trial <PL1-W-in-0.5-W-steps> <tier-1..5> <seconds>\n");
             return 64;
         }
-        return runTrial(pl1, tier, seconds);
+        return runTrial(pl1HalfWatts, tier, seconds);
     }
-    std::fprintf(stderr, "Usage: apextune-power-probe [controller [--machine] | trial <PL1-W> <tier-1..5> <seconds>]\n");
+    std::fprintf(stderr, "Usage: apextune-power-probe [controller [--machine] | trial <PL1-W-in-0.5-W-steps> <tier-1..5> <seconds>]\n");
     return 64;
 }

@@ -2,14 +2,20 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 
-static void check(bool value) { assert(value); }
+static void checkAt(bool value, int line) {
+    if (!value) std::fprintf(stderr, "decode_test failure at line %d\n", line);
+    assert(value);
+}
+#define check(...) checkAt((__VA_ARGS__), __LINE__)
 
 static uint64_t limit(uint64_t pl1, uint64_t pl2, uint64_t flags = 0) {
     return flags | (pl1 & APT_PL1_POWER_MASK) | ((pl2 & 0x7fffULL) << 32);
 }
 
 int main() {
+    check(APT_POWER_VERSION == 4 && APT_PROFILE_LEVEL_COUNT == 141);
     apt_power_snapshot s{};
     apt_decoded_power d{};
     check(!apt_decode_power(nullptr, &d));
@@ -43,6 +49,7 @@ int main() {
     session.size = sizeof(session);
     check(apt_valid_header(session.magic, session.version, session.size, sizeof(session)));
     check(!apt_valid_header(session.magic, 2, session.size, sizeof(session)));
+    check(!apt_valid_header(session.magic, 3, session.size, sizeof(session)));
     check(!apt_valid_header(session.magic, session.version, session.size - 1, sizeof(session)));
     check(!apt_valid_header(0, session.version, session.size, sizeof(session)));
 
@@ -50,48 +57,62 @@ int main() {
         APT_PL2_ENABLE_MASK | APT_PL2_CLAMP_MASK | (1ULL << 17) | (1ULL << 49);
     const uint64_t baseline = limit(100 * 8, 125 * 8, flags);
     uint64_t target = 0;
-    uint32_t pl2_watts = 0;
-    const uint32_t profiles[] = {10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80};
-    for (uint32_t pl1 : profiles) {
+    uint32_t pl2_half_watts = 0;
+    for (uint32_t pl1 = APT_PROFILE_MIN_HALF_WATTS; pl1 <= APT_PROFILE_MAX_HALF_WATTS; ++pl1) {
         check(apt_is_profile_pl1(pl1));
         for (uint32_t tier = 1; tier <= APT_TURBO_TIER_COUNT; ++tier) {
-            check(apt_profile_pl2(pl1, tier, 125, &pl2_watts));
-            const uint32_t requested = pl1 + (tier - 1) * 5;
-            check(pl2_watts == (requested < 80 ? requested : 80));
-            check(apt_build_profile_limit(3, baseline, baseline, pl1, tier, &target, &pl2_watts));
-            check((target & APT_PL1_POWER_MASK) == pl1 * 8);
-            check(((target & APT_PL2_POWER_MASK) >> 32) == pl2_watts * 8);
-            check(pl2_watts <= 80 && pl2_watts >= pl1);
+            check(apt_profile_pl2(pl1, tier, 250, &pl2_half_watts));
+            const uint32_t requested = pl1 + (tier - 1) * 10;
+            check(pl2_half_watts == (requested < 160 ? requested : 160));
+            check(apt_build_profile_limit(3, baseline, baseline, pl1, pl2_half_watts, tier, &target));
+            check((target & APT_PL1_POWER_MASK) == pl1 * 4);
+            check(((target & APT_PL2_POWER_MASK) >> 32) == pl2_half_watts * 4);
+            check(pl2_half_watts <= 160 && pl2_half_watts >= pl1);
             check((target & ~APT_PROFILE_POWER_MASK) == (baseline & ~APT_PROFILE_POWER_MASK));
         }
     }
-    check(!apt_is_profile_pl1(9) && !apt_is_profile_pl1(12) && !apt_is_profile_pl1(85));
-    check(!apt_profile_pl2(10, 0, 80, &pl2_watts));
-    check(!apt_profile_pl2(10, 6, 80, &pl2_watts));
-    check(!apt_profile_pl2(10, 1, 80, nullptr));
-    check(!apt_profile_pl2(80, 5, 79, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline, baseline, 12, 1, &target, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline, baseline, 25, 6, &target, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline | APT_POWER_LOCK_MASK, baseline, 10, 1, &target, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline, baseline | APT_POWER_LOCK_MASK, 10, 1, &target, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline, baseline & ~APT_PL1_ENABLE_MASK, 10, 1, &target, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline, baseline & ~APT_PL2_ENABLE_MASK, 10, 1, &target, &pl2_watts));
+    check(!apt_is_profile_pl1(19) && !apt_is_profile_pl1(161) && !apt_is_profile_pl1(170));
+    uint32_t parsed_half_watts = 0;
+    check(apt_parse_half_watts("10", &parsed_half_watts) && parsed_half_watts == 20);
+    check(apt_parse_half_watts("10.0", &parsed_half_watts) && parsed_half_watts == 20);
+    check(apt_parse_half_watts("10.5", &parsed_half_watts) && parsed_half_watts == 21);
+    check(apt_parse_half_watts("10.50", &parsed_half_watts) && parsed_half_watts == 21);
+    check(apt_parse_half_watts("80", &parsed_half_watts) && parsed_half_watts == 160);
+    check(!apt_parse_half_watts("10.25", &parsed_half_watts));
+    check(!apt_parse_half_watts("-10", &parsed_half_watts));
+    check(!apt_parse_half_watts("nan", &parsed_half_watts));
+    check(!apt_parse_half_watts("inf", &parsed_half_watts));
+    check(!apt_parse_half_watts("10.000", &parsed_half_watts));
+    check(!apt_profile_pl2(20, 0, 160, &pl2_half_watts));
+    check(!apt_profile_pl2(20, 6, 160, &pl2_half_watts));
+    check(!apt_profile_pl2(20, 1, 160, nullptr));
+    check(!apt_profile_pl2(160, 5, 158, &pl2_half_watts));
+    check(!apt_build_profile_limit(3, baseline, baseline, 19, 19, 1, &target));
+    check(!apt_build_profile_limit(3, baseline, baseline, 25, 25, 6, &target));
+    check(!apt_build_profile_limit(3, baseline | APT_POWER_LOCK_MASK, baseline, 20, 20, 1, &target));
+    check(!apt_build_profile_limit(3, baseline, baseline | APT_POWER_LOCK_MASK, 20, 20, 1, &target));
+    check(!apt_build_profile_limit(3, baseline, baseline & ~APT_PL1_ENABLE_MASK, 20, 20, 1, &target));
+    check(!apt_build_profile_limit(3, baseline, baseline & ~APT_PL2_ENABLE_MASK, 20, 20, 1, &target));
+    check(!apt_build_profile_limit(3, baseline, baseline, 20, 31, 2, &target));
+    check(apt_build_profile_limit(3, baseline, baseline, 21, 22, 2, &target));
+    check((target & APT_PL1_POWER_MASK) == 21 * 4);
+    check(((target & APT_PL2_POWER_MASK) >> 32) == 22 * 4);
+    check(!apt_build_profile_limit(3, baseline, baseline, 21, 32, 2, &target));
     const uint64_t lower_original_pl2 = limit(100 * 8, 62 * 8, flags);
-    check(apt_build_profile_limit(3, lower_original_pl2, lower_original_pl2, 55, 5, &target, &pl2_watts));
-    check(pl2_watts == 62 && ((target & APT_PL2_POWER_MASK) >> 32) == 62 * 8);
-    check(!apt_build_profile_limit(3, lower_original_pl2, lower_original_pl2, 65, 1, &target, &pl2_watts));
+    check(apt_build_profile_limit(3, lower_original_pl2, lower_original_pl2, 110, 124, 5, &target));
+    check(((target & APT_PL2_POWER_MASK) >> 32) == 124 * 4);
+    check(!apt_build_profile_limit(3, lower_original_pl2, lower_original_pl2, 130, 130, 1, &target));
     const uint64_t lower_original_pl1 = limit(55 * 8, 80 * 8, flags);
-    check(!apt_build_profile_limit(3, lower_original_pl1, lower_original_pl1, 60, 1, &target, &pl2_watts));
+    check(!apt_build_profile_limit(3, lower_original_pl1, lower_original_pl1, 120, 120, 1, &target));
     check(!apt_build_profile_limit(15, limit(0x7fff, 0x7fff, flags), limit(0x7fff, 0x7fff, flags),
-                                   80, 5, &target, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline, baseline, 10, 1, nullptr, &pl2_watts));
-    check(!apt_build_profile_limit(3, baseline, baseline, 10, 1, &target, nullptr));
+                                   160, 160, 1, &target));
+    check(!apt_build_profile_limit(0, baseline, baseline, 20, 20, 1, &target));
+    check(!apt_build_profile_limit(3, baseline, baseline, 20, 20, 1, nullptr));
 
     const uint64_t reduced_current = limit(25 * 8, 25 * 8, flags | (1ULL << 55));
-    check(apt_build_profile_limit(3, baseline, reduced_current, 75, 5, &target, &pl2_watts));
-    check(pl2_watts == 80);
-    check((target & APT_PL1_POWER_MASK) == 75 * 8);
-    check(((target & APT_PL2_POWER_MASK) >> 32) == 80 * 8);
+    check(apt_build_profile_limit(3, baseline, reduced_current, 150, 160, 5, &target));
+    check((target & APT_PL1_POWER_MASK) == 150 * 4);
+    check(((target & APT_PL2_POWER_MASK) >> 32) == 160 * 4);
     check((target & ~APT_PROFILE_POWER_MASK) == (reduced_current & ~APT_PROFILE_POWER_MASK));
 
     const uint64_t changed_power = limit(35 * 8, 50 * 8,

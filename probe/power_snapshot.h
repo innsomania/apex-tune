@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define APT_POWER_MAGIC 0x41505431u
-#define APT_POWER_VERSION 3u
+#define APT_POWER_VERSION 4u
 #define APT_SELECTOR_SNAPSHOT 0u
 #define APT_SELECTOR_BEGIN_SESSION 1u
 #define APT_SELECTOR_SET_PROFILE 2u
@@ -14,12 +14,12 @@
 #define APT_MSR_PACKAGE_POWER_LIMIT 0x610u
 #define APT_WATCHDOG_MAX_SECONDS 30u
 #define APT_HEARTBEAT_SECONDS 10u
-#define APT_PROFILE_LEVEL_COUNT 15u
+#define APT_PROFILE_LEVEL_COUNT 141u
 #define APT_TURBO_TIER_COUNT 5u
-#define APT_PROFILE_MIN_WATTS 10u
-#define APT_PROFILE_MAX_WATTS 80u
-#define APT_PROFILE_STEP_WATTS 5u
-#define APT_TURBO_TIER_HEADROOM_WATTS 5u
+#define APT_PROFILE_MIN_HALF_WATTS 20u
+#define APT_PROFILE_MAX_HALF_WATTS 160u
+#define APT_PROFILE_STEP_HALF_WATTS 1u
+#define APT_TURBO_TIER_HEADROOM_HALF_WATTS 10u
 #define APT_UNDERVOLT_LOCK_UNKNOWN 0u
 #define APT_PL1_POWER_MASK 0x0000000000007fffULL
 #define APT_PL1_ENABLE_MASK 0x0000000000008000ULL
@@ -50,7 +50,8 @@ typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint16_t version;
     uint16_t size;
-    uint32_t pl1_watts;
+    uint32_t pl1_half_watts;
+    uint32_t pl2_half_watts;
     uint32_t turbo_tier;
 } apt_profile_request;
 
@@ -59,8 +60,8 @@ typedef struct __attribute__((packed)) {
     uint16_t version;
     uint16_t size;
     uint32_t active;
-    uint32_t pl1_watts;
-    uint32_t pl2_watts;
+    uint32_t pl1_half_watts;
+    uint32_t pl2_half_watts;
     uint32_t turbo_tier;
     uint64_t original_raw;
     uint64_t current_raw;
@@ -82,21 +83,51 @@ static inline int apt_valid_header(uint32_t magic, uint16_t version, uint16_t si
     return magic == APT_POWER_MAGIC && version == APT_POWER_VERSION && size == expected_size;
 }
 
-static inline int apt_is_profile_pl1(uint32_t watts) {
-    return watts >= APT_PROFILE_MIN_WATTS && watts <= APT_PROFILE_MAX_WATTS &&
-           (watts - APT_PROFILE_MIN_WATTS) % APT_PROFILE_STEP_WATTS == 0;
+static inline int apt_is_profile_pl1(uint32_t half_watts) {
+    return half_watts >= APT_PROFILE_MIN_HALF_WATTS &&
+           half_watts <= APT_PROFILE_MAX_HALF_WATTS &&
+           (half_watts - APT_PROFILE_MIN_HALF_WATTS) % APT_PROFILE_STEP_HALF_WATTS == 0;
 }
 
-static inline int apt_profile_pl2(uint32_t pl1_watts, uint32_t turbo_tier,
-                                  uint32_t baseline_pl2_watts,
-                                  uint32_t *pl2_watts) {
-    if (!pl2_watts || !apt_is_profile_pl1(pl1_watts) ||
+static inline int apt_parse_half_watts(const char *text, uint32_t *half_watts) {
+    if (!text || !*text || !half_watts) return 0;
+    uint64_t whole = 0;
+    const char *cursor = text;
+    if (*cursor < '0' || *cursor > '9') return 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        whole = whole * 10u + (unsigned)(*cursor - '0');
+        if (whole > UINT32_MAX / 2u) return 0;
+        ++cursor;
+    }
+    uint32_t fraction = 0;
+    if (*cursor == '.') {
+        ++cursor;
+        if (*cursor == '5') {
+            fraction = 1;
+            ++cursor;
+            if (*cursor == '0') ++cursor;
+        }
+        else if (*cursor == '0') {
+            ++cursor;
+            if (*cursor == '0') ++cursor;
+        } else return 0;
+    }
+    if (*cursor != '\0') return 0;
+    *half_watts = (uint32_t)(whole * 2u + fraction);
+    return 1;
+}
+
+static inline int apt_profile_pl2(uint32_t pl1_half_watts, uint32_t turbo_tier,
+                                  uint32_t baseline_pl2_half_watts,
+                                  uint32_t *pl2_half_watts) {
+    if (!pl2_half_watts || !apt_is_profile_pl1(pl1_half_watts) ||
         turbo_tier == 0 || turbo_tier > APT_TURBO_TIER_COUNT) return 0;
-    if (baseline_pl2_watts > APT_PROFILE_MAX_WATTS)
-        baseline_pl2_watts = APT_PROFILE_MAX_WATTS;
-    if (baseline_pl2_watts < pl1_watts) return 0;
-    const uint32_t requested = pl1_watts + (turbo_tier - 1u) * APT_TURBO_TIER_HEADROOM_WATTS;
-    *pl2_watts = requested < baseline_pl2_watts ? requested : baseline_pl2_watts;
+    if (baseline_pl2_half_watts > APT_PROFILE_MAX_HALF_WATTS)
+        baseline_pl2_half_watts = APT_PROFILE_MAX_HALF_WATTS;
+    if (baseline_pl2_half_watts < pl1_half_watts) return 0;
+    const uint32_t requested = pl1_half_watts +
+        (turbo_tier - 1u) * APT_TURBO_TIER_HEADROOM_HALF_WATTS;
+    *pl2_half_watts = requested < baseline_pl2_half_watts ? requested : baseline_pl2_half_watts;
     return 1;
 }
 
@@ -121,23 +152,27 @@ static inline int apt_decode_power(const apt_power_snapshot *snapshot,
 
 // Produces a PL1/PL2-only RAPL update. Other register bits are preserved exactly.
 static inline int apt_build_profile_limit(uint64_t unit_msr, uint64_t original_raw,
-                                          uint64_t current_raw, uint32_t pl1_watts,
-                                          uint32_t turbo_tier, uint64_t *updated_raw,
-                                          uint32_t *pl2_watts) {
-    if (!updated_raw || !pl2_watts || !apt_is_profile_pl1(pl1_watts)) return 0;
+                                          uint64_t current_raw, uint32_t pl1_half_watts,
+                                          uint32_t pl2_half_watts, uint32_t turbo_tier,
+                                          uint64_t *updated_raw) {
+    if (!updated_raw || !apt_is_profile_pl1(pl1_half_watts) ||
+        pl2_half_watts < pl1_half_watts || pl2_half_watts > APT_PROFILE_MAX_HALF_WATTS) return 0;
     if ((original_raw & APT_POWER_LOCK_MASK) != 0 || (current_raw & APT_POWER_LOCK_MASK) != 0 ||
         (current_raw & APT_PL1_ENABLE_MASK) == 0 ||
         (current_raw & APT_PL2_ENABLE_MASK) == 0) return 0;
     const unsigned exponent = (unsigned)(unit_msr & 0x0f);
-    const uint64_t unit = 1ULL << exponent;
-    const uint64_t pl1_units = (uint64_t)pl1_watts * unit;
+    if (exponent == 0) return 0; // Half-watt target is not exactly representable.
+    const uint64_t half_watt_units = 1ULL << (exponent - 1);
+    const uint64_t pl1_units = (uint64_t)pl1_half_watts * half_watt_units;
     const uint64_t original_pl1 = original_raw & APT_PL1_POWER_MASK;
     const uint64_t original_pl2 = (original_raw & APT_PL2_POWER_MASK) >> 32;
-    const uint32_t baseline_pl2_watts = (uint32_t)(original_pl2 / unit);
-    if (!apt_profile_pl2(pl1_watts, turbo_tier, baseline_pl2_watts, pl2_watts)) return 0;
-    const uint64_t pl2_units = (uint64_t)(*pl2_watts) * unit;
-    if (pl1_units > (uint64_t)APT_PROFILE_MAX_WATTS * unit ||
-        pl2_units > (uint64_t)APT_PROFILE_MAX_WATTS * unit ||
+    const uint32_t baseline_pl2_half_watts = (uint32_t)(original_pl2 / half_watt_units);
+    uint32_t max_pl2_half_watts = 0;
+    if (!apt_profile_pl2(pl1_half_watts, turbo_tier, baseline_pl2_half_watts,
+                         &max_pl2_half_watts) || pl2_half_watts > max_pl2_half_watts) return 0;
+    const uint64_t pl2_units = (uint64_t)pl2_half_watts * half_watt_units;
+    if (pl1_units > (uint64_t)APT_PROFILE_MAX_HALF_WATTS * half_watt_units ||
+        pl2_units > (uint64_t)APT_PROFILE_MAX_HALF_WATTS * half_watt_units ||
         pl1_units > APT_PL1_POWER_MASK || pl2_units > 0x7fffULL ||
         pl1_units > original_pl1 || pl2_units > original_pl2) return 0;
     *updated_raw = (current_raw & ~APT_PROFILE_POWER_MASK) |

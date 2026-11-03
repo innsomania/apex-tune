@@ -40,8 +40,8 @@ private:
     IOReturn restoreLease();
     IOReturn armWatchdog();
     void fillSessionResult(apt_session_result *result, uint64_t originalRaw,
-                           uint64_t currentRaw, bool active, uint32_t pl1Watts,
-                           uint32_t pl2Watts, uint32_t turboTier) const;
+                           uint64_t currentRaw, bool active, uint32_t pl1HalfWatts,
+                           uint32_t pl2HalfWatts, uint32_t turboTier) const;
 
     IOWorkLoop *workLoop = nullptr;
     IOCommandGate *commandGate = nullptr;
@@ -49,8 +49,8 @@ private:
     ApexTunePowerClient *leaseClient = nullptr;
     uint64_t originalLimit = 0;
     uint64_t appliedLimit = 0;
-    uint32_t activePL1Watts = 0;
-    uint32_t activePL2Watts = 0;
+    uint32_t activePL1HalfWatts = 0;
+    uint32_t activePL2HalfWatts = 0;
     uint32_t activeTurboTier = 0;
     bool stopping = false;
 };
@@ -151,7 +151,7 @@ void ApexTunePowerReader::stop(IOService *provider) {
         leaseClient = nullptr;
         originalLimit = 0;
         appliedLimit = 0;
-        activePL1Watts = activePL2Watts = activeTurboTier = 0;
+        activePL1HalfWatts = activePL2HalfWatts = activeTurboTier = 0;
         formerClient->owner = nullptr;
         formerClient->release();
     }
@@ -253,15 +253,15 @@ IOReturn ApexTunePowerReader::armWatchdog() {
 
 void ApexTunePowerReader::fillSessionResult(apt_session_result *result, uint64_t originalRaw,
                                              uint64_t currentRaw, bool active,
-                                             uint32_t pl1Watts, uint32_t pl2Watts,
+                                             uint32_t pl1HalfWatts, uint32_t pl2HalfWatts,
                                              uint32_t turboTier) const {
     bzero(result, sizeof(*result));
     result->magic = APT_POWER_MAGIC;
     result->version = APT_POWER_VERSION;
     result->size = sizeof(*result);
     result->active = active ? 1u : 0u;
-    result->pl1_watts = pl1Watts;
-    result->pl2_watts = pl2Watts;
+    result->pl1_half_watts = pl1HalfWatts;
+    result->pl2_half_watts = pl2HalfWatts;
     result->turbo_tier = turboTier;
     result->original_raw = originalRaw;
     result->current_raw = currentRaw;
@@ -284,7 +284,7 @@ IOReturn ApexTunePowerReader::beginSessionAction(OSObject *owner, void *arg0, vo
         return kIOReturnNotPermitted;
     self->originalLimit = before;
     self->appliedLimit = before;
-    self->activePL1Watts = self->activePL2Watts = self->activeTurboTier = 0;
+    self->activePL1HalfWatts = self->activePL2HalfWatts = self->activeTurboTier = 0;
     self->leaseClient = client;
     client->retain();
     self->retain();
@@ -313,10 +313,9 @@ IOReturn ApexTunePowerReader::setProfileAction(OSObject *owner, void *arg0, void
     if (self->leaseClient != client) return kIOReturnNotPermitted;
     const uint64_t current = readPackageLimitMSR();
     uint64_t target = 0;
-    uint32_t pl2Watts = 0;
     if (!apt_build_profile_limit(readPowerUnitMSR(), self->originalLimit, current,
-                                 request->pl1_watts, request->turbo_tier,
-                                 &target, &pl2Watts)) return kIOReturnNotPermitted;
+                                 request->pl1_half_watts, request->pl2_half_watts,
+                                 request->turbo_tier, &target)) return kIOReturnNotPermitted;
     if (self->armWatchdog() != kIOReturnSuccess) {
         const uint64_t original = self->originalLimit;
         self->restoreLease();
@@ -334,11 +333,11 @@ IOReturn ApexTunePowerReader::setProfileAction(OSObject *owner, void *arg0, void
         return restoreStatus == kIOReturnSuccess ? kIOReturnError : restoreStatus;
     }
     self->appliedLimit = applied;
-    self->activePL1Watts = request->pl1_watts;
-    self->activePL2Watts = pl2Watts;
+    self->activePL1HalfWatts = request->pl1_half_watts;
+    self->activePL2HalfWatts = request->pl2_half_watts;
     self->activeTurboTier = request->turbo_tier;
     self->fillSessionResult(result, self->originalLimit, applied, true,
-                            self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
+                            self->activePL1HalfWatts, self->activePL2HalfWatts, self->activeTurboTier);
     return kIOReturnSuccess;
 }
 
@@ -355,7 +354,7 @@ IOReturn ApexTunePowerReader::heartbeatAction(OSObject *owner, void *arg0, void 
         self->watchdog->cancelTimeout();
         self->watchdog->disable();
         self->fillSessionResult(result, self->originalLimit, current, true,
-                                self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
+                                self->activePL1HalfWatts, self->activePL2HalfWatts, self->activeTurboTier);
         return kIOReturnNotPermitted;
     }
     const IOReturn status = self->armWatchdog();
@@ -367,7 +366,7 @@ IOReturn ApexTunePowerReader::heartbeatAction(OSObject *owner, void *arg0, void 
         return status;
     }
     self->fillSessionResult(result, self->originalLimit, current, true,
-                            self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
+                            self->activePL1HalfWatts, self->activePL2HalfWatts, self->activeTurboTier);
     return status;
 }
 
@@ -395,7 +394,7 @@ IOReturn ApexTunePowerReader::restoreLease() {
     leaseClient = nullptr;
     originalLimit = 0;
     appliedLimit = 0;
-    activePL1Watts = activePL2Watts = activeTurboTier = 0;
+    activePL1HalfWatts = activePL2HalfWatts = activeTurboTier = 0;
     formerClient->release();
     release();
     return kIOReturnSuccess;
@@ -414,7 +413,7 @@ IOReturn ApexTunePowerReader::finishSessionAction(OSObject *owner, void *arg0, v
     IOReturn status = self->restoreLease();
     const uint64_t restored = readPackageLimitMSR();
     self->fillSessionResult(result, original, restored, self->leaseClient != nullptr,
-                            self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
+                            self->activePL1HalfWatts, self->activePL2HalfWatts, self->activeTurboTier);
     return status;
 }
 

@@ -479,15 +479,13 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
                 return
             }
             latestProposal = proposal
-            proposedItem.title = "Proposed: PL1 \(proposal.pl1) W · tier \(proposal.tier) · PL2 \(proposal.pl2) W"
-            let thermalReduction = thermalLevel == .serious || power.cpuTemperatureC >= 75 ||
-                power.packageWatts >= 75
+            proposedItem.title = "Proposed: PL1 \(proposal.pl1Text) W · tier \(proposal.tier) · PL2 \(proposal.pl2Text) W"
             let turboDecision = turboBurstBudget.constrain(proposal,
                 cpuTemperatureC: power.cpuTemperatureC, thermal: thermalLevel, now: now)
             latestProposal = turboDecision.profile
             if let change = hysteresis.observe(turboDecision.profile, now: now,
-                                               thermalReduction: thermalReduction,
-                                               immediateReduction: power.cpuTemperatureC >= 80 ||
+                                               immediateReduction: power.cpuTemperatureC >= 75 ||
+                                                   thermalLevel == .serious ||
                                                    turboDecision.closeImmediately),
                pendingProfileAt == nil {
                 sendProfile(change, at: now)
@@ -499,7 +497,7 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
         if let frame {
             if let proposal = ProfilePolicy.proposal(for: frame) {
                 latestProposal = proposal
-                proposedItem.title = "Proposed: PL1 \(proposal.pl1) W · tier \(proposal.tier) · PL2 \(proposal.pl2) W"
+                proposedItem.title = "Proposed: PL1 \(proposal.pl1Text) W · tier \(proposal.tier) · PL2 \(proposal.pl2Text) W"
             } else {
                 latestProposal = nil
                 proposedItem.title = "Proposed profile: unavailable (sensor/baseline)"
@@ -508,7 +506,7 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
     }
 
     private func sendProfile(_ profile: Profile, at time: Date) {
-        probe?.send("set \(profile.pl1) \(profile.tier)")
+        probe?.send("set \(profile.pl1Text) \(profile.tier) \(profile.pl2Text)")
         pendingProfileTarget = profile
         pendingProfileAt = time
     }
@@ -523,11 +521,11 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
               let actual2 = event["actual_pl2_watts"] as? Double else { return }
         actualPL1 = actual1
         actualPL2 = actual2
-        actualItem.title = String(format: "Actual limits: PL1 %.1f W · PL2 %.1f W", actual1, actual2)
+        actualItem.title = String(format: "Actual limits: PL1 %.3f W · PL2 %.3f W", actual1, actual2)
         if name == "ready" {
-            originalPL1 = Int((event["original_pl1_watts"] as? Double ?? 0).rounded(.down))
-            originalPL2 = Int((event["original_pl2_watts"] as? Double ?? 0).rounded(.down))
-            guard originalPL1 > 0, originalPL2 >= 10 else {
+            originalPL1 = Int(((event["original_pl1_watts"] as? Double ?? 0) * 2).rounded(.down))
+            originalPL2 = Int(((event["original_pl2_watts"] as? Double ?? 0) * 2).rounded(.down))
+            guard originalPL1 >= 20, originalPL2 >= 20 else {
                 releaseControl(reason: "Probe returned an invalid baseline")
                 return
             }
@@ -542,8 +540,15 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             sensorFallback = SensorFallbackRecovery()
             confirmedSafeFallback = false
             sendProfile(SensorFallbackRecovery.safeProfile, at: Date())
-        } else if name == "applied", let pl1 = event["pl1_watts"] as? Int,
-                  let tier = event["tier"] as? Int, let pl2 = event["pl2_watts"] as? Int {
+        } else if name == "applied", let pl1W = event["pl1_watts"] as? Double,
+                  let tier = event["tier"] as? Int, let pl2W = event["pl2_watts"] as? Double {
+            let pl1 = Int((pl1W * 2).rounded())
+            let pl2 = Int((pl2W * 2).rounded())
+            guard abs(pl1W * 2 - Double(pl1)) < 0.001,
+                  abs(pl2W * 2 - Double(pl2)) < 0.001 else {
+                releaseControl(reason: "Probe returned non-representable half-watt readback")
+                return
+            }
             let profile = Profile(pl1: pl1, tier: tier, pl2: pl2)
             controller.applyConfirmed(profile)
             hysteresis.confirmApplied(profile)
@@ -552,12 +557,12 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
                 pendingProfileAt = nil
                 pendingProfileTarget = nil
             }
-            confirmedSafeFallback = profile == Profile(pl1: 10, tier: 1, pl2: 10)
+            confirmedSafeFallback = profile == SensorFallbackRecovery.safeProfile
             currentServiceState = .controlling
             if !sensorFallback.isDegraded {
                 serviceMessage = "Automatic power control active"
             }
-            logControl("profile confirmed PL1=\(pl1)W tier=\(tier) PL2=\(pl2)W")
+            logControl("profile confirmed PL1=\(profile.pl1Text)W tier=\(tier) PL2=\(profile.pl2Text)W")
         } else if name == "heartbeat" {
             heartbeatSentAt = nil
             logControl("kernel lease heartbeat confirmed")
@@ -565,7 +570,7 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             controller.restored()
             currentServiceState = .restored
             serviceMessage = "Saved power limits restored"
-            actualItem.title = String(format: "Actual limits restored: PL1 %.1f W · PL2 %.1f W", actual1, actual2)
+            actualItem.title = String(format: "Actual limits restored: PL1 %.3f W · PL2 %.3f W", actual1, actual2)
             logControl(String(format: "baseline restored PL1=%.1fW PL2=%.1fW", actual1, actual2))
             finishControl(reason: "Restored Apple's saved package limits")
         } else if name == "restore_failed" {
@@ -671,10 +676,11 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
         }
         modeItem.title = "Power service: \(status.state.rawValue) · \(status.message)"
         if let pl1 = status.actualPL1, let pl2 = status.actualPL2 {
-            actualItem.title = String(format: "Actual limits: PL1 %.1f W · PL2 %.1f W", pl1, pl2)
+            actualItem.title = String(format: "Actual limits: PL1 %.3f W · PL2 %.3f W", pl1, pl2)
         } else { actualItem.title = "Actual limits: unavailable" }
         if let pl1 = status.appliedPL1, let tier = status.appliedTier, let pl2 = status.appliedPL2 {
-            proposedItem.title = "Confirmed profile: PL1 \(pl1) W · tier \(tier) · PL2 \(pl2) W"
+            proposedItem.title = String(format: "Confirmed profile: PL1 %.1f W · tier %d · PL2 %.1f W",
+                                        Double(pl1) / 2, tier, Double(pl2) / 2)
         } else { proposedItem.title = "Confirmed profile: unavailable" }
         if let watts = status.packageWatts {
             packageItem.title = String(format: "Package power: %.1f W", watts)

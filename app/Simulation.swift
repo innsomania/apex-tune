@@ -32,7 +32,7 @@ struct SimulationReport {
                                                  baselinePL1: baselinePL1,
                                                  baselinePL2: baselinePL2)
             if let decision {
-                rows.append("\(name): proposed PL1 \(decision.pl1) W, tier \(decision.tier), PL2 \(decision.pl2) W")
+                rows.append("\(name): proposed PL1 \(decision.pl1Text) W, tier \(decision.tier), PL2 \(decision.pl2Text) W")
             } else {
                 rows.append("\(name): release / no safe profile")
             }

@@ -24,8 +24,12 @@ $(BUILD)/decode-test: tests/decode_test.cpp power_snapshot.h | $(BUILD)
 test: kext $(BUILD)/decode-test $(BUILD)/apextune-power-probe
 	$(BUILD)/decode-test
 	plutil -lint $(BUNDLE)/Contents/Info.plist
-	@set +e; $(BUILD)/apextune-power-probe trial 12 1 2 >/dev/null 2>$(BUILD)/bad-args.txt; status=$$?; set -e; \
+	@set +e; $(BUILD)/apextune-power-probe trial 9.5 1 2 >/dev/null 2>$(BUILD)/bad-args.txt; status=$$?; set -e; \
 	  test $$status -eq 64; grep -q 'Trial requires' $(BUILD)/bad-args.txt
+	@set +e; $(BUILD)/apextune-power-probe trial 10.25 1 2 >/dev/null 2>$(BUILD)/bad-quarter.txt; status=$$?; set -e; \
+	  test $$status -eq 64; grep -q 'Usage:' $(BUILD)/bad-quarter.txt
+	@set +e; $(BUILD)/apextune-power-probe trial 10.5 0 2 >/dev/null 2>$(BUILD)/bad-tier.txt; status=$$?; set -e; \
+	  test $$status -eq 64; grep -q 'Trial requires PL1 10..80 W in 0.5 W steps' $(BUILD)/bad-tier.txt
 
 kext: $(BUNDLE)/Contents/MacOS/ApexTunePowerReader
 

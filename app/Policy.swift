@@ -20,6 +20,11 @@ struct Profile: Equatable {
     let pl1: Int
     let tier: Int
     let pl2: Int
+
+    var pl1Watts: Double { Double(pl1) / 2 }
+    var pl2Watts: Double { Double(pl2) / 2 }
+    var pl1Text: String { "\(pl1 / 2).\(pl1.isMultiple(of: 2) ? "0" : "5")" }
+    var pl2Text: String { "\(pl2 / 2).\(pl2.isMultiple(of: 2) ? "0" : "5")" }
 }
 
 enum ThermalLevel: String {
@@ -40,53 +45,54 @@ struct SensorFrame: Equatable {
 }
 
 struct ProfilePolicy {
-    static let pl1Levels = Array(stride(from: 10, through: 80, by: 5))
-    static let tierHeadroom = [0, 5, 10, 15, 20]
-    static let maximumWatts = 80
+    static let pl1Levels = Array(stride(from: 20, through: 160, by: 1))
+    static let tierHeadroomHalfWatts = [0, 10, 20, 30, 40]
+    static let maximumHalfWatts = 160
 
     static func fixedProfile(pl1: Int, tier: Int, baselinePL1: Int,
                              baselinePL2: Int) -> Profile? {
         guard pl1Levels.contains(pl1), (1...5).contains(tier),
-              pl1 <= min(maximumWatts, baselinePL1),
+              pl1 <= min(maximumHalfWatts, baselinePL1),
               baselinePL2 >= pl1 else { return nil }
-        let pl2 = min(maximumWatts, baselinePL2, pl1 + tierHeadroom[tier - 1])
+        let pl2 = min(maximumHalfWatts, baselinePL2, pl1 + tierHeadroomHalfWatts[tier - 1])
         return pl2 >= pl1 ? Profile(pl1: pl1, tier: tier, pl2: pl2) : nil
     }
 
-    static func proposal(for frame: SensorFrame, baselinePL1: Int = 80,
-                         baselinePL2: Int = 80, requirePower: Bool = false) -> Profile? {
+    static func proposal(for frame: SensorFrame, baselinePL1: Int = 160,
+                         baselinePL2: Int = 160, requirePower: Bool = false) -> Profile? {
         guard frame.cpuLoad.isFinite, frame.cpuLoad >= 0, frame.cpuLoad <= 1,
               frame.thermal != .critical,
               !requirePower || frame.thermal != .unknown,
               !requirePower || frame.power != nil else { return nil }
 
-        let index = min(14, Int((frame.cpuLoad * 14).rounded(.down)))
+        let index = min(pl1Levels.count - 1,
+                        Int((frame.cpuLoad * Double(pl1Levels.count - 1)).rounded(.down)))
         var desiredPL1 = pl1Levels[index]
         var forceBaseTier = frame.thermal == .serious
-        if frame.thermal == .serious { desiredPL1 -= 15 }
-        else if frame.thermal == .fair { desiredPL1 -= 5 }
+        if frame.thermal == .serious { desiredPL1 -= 30 }
+        else if frame.thermal == .fair { desiredPL1 -= 10 }
         if let power = frame.power {
             guard frame.timestamp.timeIntervalSince(power.timestamp) <= 4,
                   power.timestamp.timeIntervalSince(frame.timestamp) <= 1,
                   power.packageWatts.isFinite, power.packageWatts >= 0,
                   power.cpuTemperatureC.isFinite, power.cpuTemperatureC > 0 else { return nil }
             if power.cpuTemperatureC >= 80 {
-                desiredPL1 = 10
+                desiredPL1 = 20
                 forceBaseTier = true
             } else if power.cpuTemperatureC >= 75 {
-                desiredPL1 = min(desiredPL1, 25)
+                desiredPL1 = min(desiredPL1, 50)
                 forceBaseTier = true
-            } else if power.cpuTemperatureC >= 70 { desiredPL1 -= 5 }
-            if power.packageWatts >= 75 { desiredPL1 -= 10 }
-            else if power.packageWatts >= 65 { desiredPL1 -= 5 }
+            } else if power.cpuTemperatureC >= 70 { desiredPL1 -= 10 }
+            if power.packageWatts >= 75 { desiredPL1 -= 20 }
+            else if power.packageWatts >= 65 { desiredPL1 -= 10 }
         }
-        if frame.thermal == .serious { desiredPL1 = min(desiredPL1, 25) }
-        desiredPL1 = max(10, desiredPL1)
+        if frame.thermal == .serious { desiredPL1 = min(desiredPL1, 50) }
+        desiredPL1 = max(20, desiredPL1)
 
-        let ceiling = min(maximumWatts, baselinePL1, baselinePL2)
+        let ceiling = min(maximumHalfWatts, baselinePL1, baselinePL2)
         guard let pl1 = pl1Levels.last(where: { $0 <= desiredPL1 && $0 <= ceiling }) else { return nil }
         let tier = forceBaseTier ? 1 : min(5, max(1, Int((frame.cpuLoad * 5).rounded(.down)) + 1))
-        let pl2 = min(maximumWatts, baselinePL2, pl1 + tierHeadroom[tier - 1])
+        let pl2 = min(maximumHalfWatts, baselinePL2, pl1 + tierHeadroomHalfWatts[tier - 1])
         guard pl2 >= pl1 else { return nil }
         return Profile(pl1: pl1, tier: tier, pl2: pl2)
     }
@@ -95,62 +101,36 @@ struct ProfilePolicy {
 struct ProfileHysteresis {
     private(set) var proposed: Profile?
     private(set) var applied: Profile?
-    private var candidate: Profile?
-    private var candidateCount = 0
-    private var candidateStartedAt = Date.distantPast
     private var lastChange = Date.distantPast
 
-    mutating func observe(_ next: Profile?, now: Date, thermalReduction: Bool = false,
+    mutating func observe(_ next: Profile?, now: Date,
                           immediateReduction: Bool = false) -> Profile? {
         proposed = next
         guard let next, let applied else { return nil }
-        guard next != applied else {
-            candidate = nil
-            candidateCount = 0
-            return nil
-        }
-        if candidate == next { candidateCount += 1 }
-        else { candidate = next; candidateCount = 1; candidateStartedAt = now }
-        let isReducing = next.pl1 < applied.pl1 || next.pl2 < applied.pl2
-        if isReducing {
-            let requiredSamples = immediateReduction ? 1 : (thermalReduction ? 2 : 5)
-            let requiredSeconds: TimeInterval = immediateReduction ? 0 : (thermalReduction ? 1 : 5)
-            guard candidateCount >= requiredSamples,
-                  now.timeIntervalSince(candidateStartedAt) >= requiredSeconds else { return nil }
-            return next
-        }
-
-        guard now.timeIntervalSince(lastChange) >= 3 else { return nil }
-        let steppedPL1 = min(next.pl1, applied.pl1 + 5)
-        var steppedTier = next.tier
-        var stepped: Profile?
-        while steppedTier >= 1 {
-            if let attempt = ProfilePolicy.fixedProfile(pl1: steppedPL1, tier: steppedTier,
-                                                         baselinePL1: 80, baselinePL2: 80),
-               attempt.pl2 <= min(applied.pl2 + 5, next.pl2) {
-                stepped = attempt
-                break
-            }
-            steppedTier -= 1
-        }
-        guard let stepped, stepped != applied else { return nil }
-        return stepped
+        guard next != applied else { return nil }
+        guard immediateReduction || now.timeIntervalSince(lastChange) >= 3 else { return nil }
+        let pl1 = immediateReduction
+            ? min(next.pl1, applied.pl1)
+            : min(max(next.pl1, applied.pl1 - 1), applied.pl1 + 1)
+        let pl2 = immediateReduction
+            ? min(next.pl2, applied.pl2)
+            : min(max(next.pl2, applied.pl2 - 1), applied.pl2 + 1)
+        let boundedPL2 = max(pl1, pl2)
+        let requiredTier = ProfilePolicy.tierHeadroomHalfWatts.firstIndex {
+            boundedPL2 <= pl1 + $0
+        }.map { $0 + 1 } ?? ProfilePolicy.tierHeadroomHalfWatts.count
+        let bounded = Profile(pl1: pl1, tier: requiredTier, pl2: boundedPL2)
+        return bounded == applied ? nil : bounded
     }
 
     mutating func confirmBaseline(pl1: Int, pl2: Int) {
         applied = Profile(pl1: pl1, tier: 1, pl2: pl2)
         lastChange = Date.distantPast
-        candidate = nil
-        candidateCount = 0
-        candidateStartedAt = .distantPast
     }
 
     mutating func confirmApplied(_ profile: Profile, at time: Date = Date()) {
         applied = profile
         lastChange = time
-        candidate = nil
-        candidateCount = 0
-        candidateStartedAt = .distantPast
     }
 }
 
@@ -202,7 +182,7 @@ struct TurboBurstBudget {
     }
 
     private func burstProfile(_ requested: Profile) -> Profile {
-        let pl2 = min(requested.pl2, requested.pl1 + 5)
+        let pl2 = min(requested.pl2, requested.pl1 + 10)
         return Profile(pl1: requested.pl1, tier: pl2 > requested.pl1 ? 2 : 1, pl2: pl2)
     }
 
@@ -274,7 +254,7 @@ struct ControllerLifecycle {
 }
 
 struct SensorFallbackRecovery {
-    static let safeProfile = Profile(pl1: 10, tier: 1, pl2: 10)
+    static let safeProfile = Profile(pl1: 20, tier: 1, pl2: 20)
     private(set) var isDegraded = true
     private(set) var consecutiveFreshSamples = 0
     private var lastCountedSample: Date?
