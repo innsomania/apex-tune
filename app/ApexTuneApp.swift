@@ -187,7 +187,10 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit ApexTune", action: #selector(quit), keyEquivalent: "q"))
         menu.items.last?.target = self
         statusItem.menu = menu
-        statusItem.button?.title = "ApexTune · Observe"
+        statusItem.button?.title = ""
+        statusItem.button?.image = NSImage(systemSymbolName: "bolt.circle", accessibilityDescription: "ApexTune")
+        statusItem.button?.image?.isTemplate = true
+        statusItem.button?.toolTip = "ApexTune"
         if controlRequested { startControl() }
         timer = ControlRuntime.scheduleControlTimer(interval: 1) { [weak self] _ in
             Task { @MainActor in self?.tick() }
@@ -401,7 +404,7 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
         modeItem.title = "Mode: observe only · \(reason)"
         packageItem.title = "Last control package power: sample may be stale"
         temperatureItem.title = "Last control CPU temperature: sample may be stale"
-        statusItem.button?.title = "ApexTune · Observe"
+        statusItem.button?.toolTip = "ApexTune · Observe"
         if quitAfterRelease { NSApp.terminate(nil) }
     }
 }
