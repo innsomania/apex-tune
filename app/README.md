@@ -28,6 +28,12 @@ If a required sample becomes stale or missing, powermetrics exits, the CLI disco
 
 The app controls package PL1/PL2 only. It does not control the Radeon GPU separately, fans, voltage, or undervolting. Undervolt-lock status remains unknown and unsupported; no voltage register is read or written. A fractional watt/temperature value in the menu is a sensor measurement. Every requested power target is an integer number of watts.
 
+## Automatic startup
+
+`--daemon` runs the controller headlessly for the root LaunchDaemon; it does not create `NSApplication`, a status bar item, or a user-session GUI. `--status` runs the per-user Aqua status menu, which reads the root service's read-only status file. The default launch remains observe-only; `--control` remains available for explicit interactive root control. Deployment plists and root-only install/remove scripts are in `deployment/`.
+
+At CPU die temperature of at least 75 °C or serious thermal pressure, the proposal caps PL1 at 25 W and forces tier 1 (PL2 equals PL1). At 80 °C it proposes 10/10 W immediately; hysteresis permits that reduction on one valid sample. When the CPU die is below 75 °C, a confirmed tier 2 PL2 burst may add at most 5 W for at most two seconds, followed by a 30-second cooldown. PL2 closes immediately when the burst expires, demand drops, or temperature reaches 75 °C. These are conservative starting caps, not temperature guarantees. Missing or older-than-four-seconds CPU die/package readings display as unavailable; a generic CPU temperature field is not labeled CPU die.
+
 ## Offline simulation
 
 ```sh

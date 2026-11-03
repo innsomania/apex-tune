@@ -62,6 +62,7 @@ struct ProfilePolicy {
 
         let index = min(14, Int((frame.cpuLoad * 14).rounded(.down)))
         var desiredPL1 = pl1Levels[index]
+        var forceBaseTier = frame.thermal == .serious
         if frame.thermal == .serious { desiredPL1 -= 15 }
         else if frame.thermal == .fair { desiredPL1 -= 5 }
         if let power = frame.power {
@@ -69,17 +70,22 @@ struct ProfilePolicy {
                   power.timestamp.timeIntervalSince(frame.timestamp) <= 1,
                   power.packageWatts.isFinite, power.packageWatts >= 0,
                   power.cpuTemperatureC.isFinite, power.cpuTemperatureC > 0 else { return nil }
-            if power.cpuTemperatureC >= 90 { desiredPL1 -= 20 }
-            else if power.cpuTemperatureC >= 85 { desiredPL1 -= 10 }
-            else if power.cpuTemperatureC >= 80 { desiredPL1 -= 5 }
+            if power.cpuTemperatureC >= 80 {
+                desiredPL1 = 10
+                forceBaseTier = true
+            } else if power.cpuTemperatureC >= 75 {
+                desiredPL1 = min(desiredPL1, 25)
+                forceBaseTier = true
+            } else if power.cpuTemperatureC >= 70 { desiredPL1 -= 5 }
             if power.packageWatts >= 75 { desiredPL1 -= 10 }
             else if power.packageWatts >= 65 { desiredPL1 -= 5 }
         }
+        if frame.thermal == .serious { desiredPL1 = min(desiredPL1, 25) }
         desiredPL1 = max(10, desiredPL1)
 
         let ceiling = min(maximumWatts, baselinePL1, baselinePL2)
         guard let pl1 = pl1Levels.last(where: { $0 <= desiredPL1 && $0 <= ceiling }) else { return nil }
-        let tier = min(5, max(1, Int((frame.cpuLoad * 5).rounded(.down)) + 1))
+        let tier = forceBaseTier ? 1 : min(5, max(1, Int((frame.cpuLoad * 5).rounded(.down)) + 1))
         let pl2 = min(maximumWatts, baselinePL2, pl1 + tierHeadroom[tier - 1])
         guard pl2 >= pl1 else { return nil }
         return Profile(pl1: pl1, tier: tier, pl2: pl2)
@@ -94,7 +100,8 @@ struct ProfileHysteresis {
     private var candidateStartedAt = Date.distantPast
     private var lastChange = Date.distantPast
 
-    mutating func observe(_ next: Profile?, now: Date, thermalReduction: Bool = false) -> Profile? {
+    mutating func observe(_ next: Profile?, now: Date, thermalReduction: Bool = false,
+                          immediateReduction: Bool = false) -> Profile? {
         proposed = next
         guard let next, let applied else { return nil }
         guard next != applied else {
@@ -106,8 +113,8 @@ struct ProfileHysteresis {
         else { candidate = next; candidateCount = 1; candidateStartedAt = now }
         let isReducing = next.pl1 < applied.pl1 || next.pl2 < applied.pl2
         if isReducing {
-            let requiredSamples = thermalReduction ? 2 : 5
-            let requiredSeconds: TimeInterval = thermalReduction ? 1 : 5
+            let requiredSamples = immediateReduction ? 1 : (thermalReduction ? 2 : 5)
+            let requiredSeconds: TimeInterval = immediateReduction ? 0 : (thermalReduction ? 1 : 5)
             guard candidateCount >= requiredSamples,
                   now.timeIntervalSince(candidateStartedAt) >= requiredSeconds else { return nil }
             return next
@@ -147,6 +154,65 @@ struct ProfileHysteresis {
     }
 }
 
+struct TurboBurstDecision: Equatable {
+    let profile: Profile
+    let closeImmediately: Bool
+}
+
+struct TurboBurstBudget {
+    private(set) var burstStartedAt: Date?
+    private(set) var cooldownUntil = Date.distantPast
+    private(set) var burstCount = 0
+    private var active = false
+
+    mutating func constrain(_ requested: Profile, cpuTemperatureC: Double?,
+                            thermal: ThermalLevel, now: Date) -> TurboBurstDecision {
+        let canBurst = requested.tier > 1 && requested.pl2 > requested.pl1 && thermal != .serious &&
+            cpuTemperatureC.map { $0.isFinite && $0 < 75 } == true
+        guard canBurst else {
+            let closed = active
+            endBurst(at: now)
+            return TurboBurstDecision(profile: baseProfile(requested), closeImmediately: closed)
+        }
+
+        if let burstStartedAt {
+            guard now.timeIntervalSince(burstStartedAt) < 2 else {
+                endBurst(at: burstStartedAt.addingTimeInterval(2))
+                return TurboBurstDecision(profile: baseProfile(requested), closeImmediately: true)
+            }
+            return TurboBurstDecision(profile: burstProfile(requested), closeImmediately: false)
+        }
+
+        guard now >= cooldownUntil else {
+            return TurboBurstDecision(profile: baseProfile(requested), closeImmediately: false)
+        }
+        return TurboBurstDecision(profile: burstProfile(requested), closeImmediately: false)
+    }
+
+    mutating func confirmApplied(_ profile: Profile, at time: Date) {
+        guard profile.tier == 2, profile.pl2 > profile.pl1,
+              !active, time >= cooldownUntil else { return }
+        burstStartedAt = time
+        active = true
+        burstCount += 1
+    }
+
+    private func baseProfile(_ requested: Profile) -> Profile {
+        Profile(pl1: requested.pl1, tier: 1, pl2: requested.pl1)
+    }
+
+    private func burstProfile(_ requested: Profile) -> Profile {
+        let pl2 = min(requested.pl2, requested.pl1 + 5)
+        return Profile(pl1: requested.pl1, tier: pl2 > requested.pl1 ? 2 : 1, pl2: pl2)
+    }
+
+    private mutating func endBurst(at time: Date) {
+        if active { cooldownUntil = time.addingTimeInterval(30) }
+        active = false
+        burstStartedAt = nil
+    }
+}
+
 struct PowerMetricsParser {
     private var pending = ""
     private var block = ""
@@ -177,7 +243,7 @@ struct PowerMetricsParser {
         guard let watts = firstNumber(in: block,
             pattern: #"(?m)^Intel energy model derived package power \(CPUs\+GT\+SA\):\s*([0-9]+(?:\.[0-9]+)?)\s*W\b"#),
               let temperature = firstNumber(in: block,
-            pattern: #"(?m)^CPU(?: die)? temperature:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:°?C)\b"#) else { return nil }
+            pattern: #"(?m)^CPU die temperature:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:°?C)\b"#) else { return nil }
         return PowerSample(packageWatts: watts, cpuTemperatureC: temperature, timestamp: now)
     }
 

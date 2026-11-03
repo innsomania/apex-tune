@@ -12,23 +12,24 @@ all: app
 
 app: $(MACOS)/ApexTune
 
-$(MACOS)/ApexTune: ApexTuneApp.swift Policy.swift Simulation.swift Info.plist $(PROBE)
+$(MACOS)/ApexTune: ApexTuneApp.swift Policy.swift ServiceStatus.swift Simulation.swift Info.plist $(PROBE)
 	mkdir -p $(MACOS) $(RESOURCES)
-	$(SWIFTC) $(SWIFTFLAGS) ApexTuneApp.swift Policy.swift Simulation.swift -framework AppKit -o $@
+	$(SWIFTC) $(SWIFTFLAGS) ApexTuneApp.swift Policy.swift ServiceStatus.swift Simulation.swift -framework AppKit -o $@
 	cp Info.plist $(CONTENTS)/Info.plist
 	cp $(PROBE) $(RESOURCES)/apextune-power-probe
 
 $(PROBE):
 	$(MAKE) -C ../probe all
 
-$(BUILD)/policy-tests: Tests.swift Policy.swift Simulation.swift | $(BUILD)
-	$(SWIFTC) $(SWIFTFLAGS) Tests.swift Policy.swift Simulation.swift -framework AppKit -o $@
+$(BUILD)/policy-tests: Tests.swift Policy.swift ServiceStatus.swift Simulation.swift | $(BUILD)
+	$(SWIFTC) $(SWIFTFLAGS) Tests.swift Policy.swift ServiceStatus.swift Simulation.swift -framework AppKit -o $@
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
 test: app $(BUILD)/policy-tests
 	plutil -lint $(CONTENTS)/Info.plist
+	plutil -lint ../deployment/com.apextune.controller.plist ../deployment/com.apextune.status.plist
 	test -x $(MACOS)/ApexTune -a -x $(RESOURCES)/apextune-power-probe
 	$(BUILD)/policy-tests
 	$(MACOS)/ApexTune --simulate | grep -q 'SIMULATION ONLY'
