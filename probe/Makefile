@@ -24,8 +24,8 @@ $(BUILD)/decode-test: tests/decode_test.cpp power_snapshot.h | $(BUILD)
 test: kext $(BUILD)/decode-test $(BUILD)/apextune-power-probe
 	$(BUILD)/decode-test
 	plutil -lint $(BUNDLE)/Contents/Info.plist
-	@set +e; $(BUILD)/apextune-power-probe trial 1 2 >/dev/null 2>$(BUILD)/bad-args.txt; status=$$?; set -e; \
-	  test $$status -eq 64; grep -q 'Usage:' $(BUILD)/bad-args.txt
+	@set +e; $(BUILD)/apextune-power-probe trial 12 1 2 >/dev/null 2>$(BUILD)/bad-args.txt; status=$$?; set -e; \
+	  test $$status -eq 64; grep -q 'Trial requires' $(BUILD)/bad-args.txt
 
 kext: $(BUNDLE)/Contents/MacOS/ApexTunePowerReader
 

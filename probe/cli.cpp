@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <poll.h>
+#include <string>
 #include <unistd.h>
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -29,10 +31,14 @@ static io_connect_t openReader() {
     kern_return_t status = IOServiceOpen(service, mach_task_self(), 0, &connection);
     IOObjectRelease(service);
     if (status != KERN_SUCCESS) {
-        std::fprintf(stderr, "Cannot open ApexTune power service (0x%x); run this command with administrator privileges.\n", status);
+        std::fprintf(stderr, "Cannot open ApexTune power service (0x%x); run as administrator.\n", status);
         return IO_OBJECT_NULL;
     }
     return connection;
+}
+
+static bool validSessionResult(const apt_session_result &result) {
+    return apt_valid_header(result.magic, result.version, result.size, sizeof(result));
 }
 
 static bool readSnapshot(io_connect_t connection, apt_power_snapshot *snapshot) {
@@ -40,19 +46,20 @@ static bool readSnapshot(io_connect_t connection, apt_power_snapshot *snapshot) 
     kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_SNAPSHOT,
                                                       nullptr, 0, snapshot, &output_size);
     if (status != KERN_SUCCESS || output_size != sizeof(*snapshot)) {
-        std::fprintf(stderr, "Power snapshot failed (0x%x). The loaded reader may be an older protocol version.\n", status);
+        std::fprintf(stderr, "Power snapshot failed (0x%x); the loaded reader may not use protocol v3.\n", status);
         return false;
     }
     apt_decoded_power decoded{};
-    if (!apt_decode_power(snapshot, &decoded)) {
-        std::fprintf(stderr, "Incompatible or invalid reader protocol. ApexTune reader v2 is required.\n");
+    if (!apt_decode_power(snapshot, &decoded) ||
+        snapshot->undervolt_lock_status != APT_UNDERVOLT_LOCK_UNKNOWN) {
+        std::fprintf(stderr, "Incompatible or invalid protocol v3 snapshot.\n");
         return false;
     }
     return true;
 }
 
-static void printLimit(const char *label, uint64_t raw, uint64_t units) {
-    const double watt_unit = 1.0 / static_cast<double>(1ULL << (units & 0x0f));
+static void printLimit(const char *label, uint64_t raw, uint64_t unitMSR) {
+    const double watt_unit = 1.0 / static_cast<double>(1ULL << (unitMSR & 0x0f));
     const uint64_t pl1 = raw & APT_PL1_POWER_MASK;
     const uint64_t pl2 = (raw & APT_PL2_POWER_MASK) >> 32;
     std::printf("%s PL1 %.2f W, PL2 %.2f W\n", label,
@@ -60,85 +67,109 @@ static void printLimit(const char *label, uint64_t raw, uint64_t units) {
                 static_cast<double>(pl2) * watt_unit);
 }
 
-static bool finish(io_connect_t connection, apt_trial_result *result) {
+static void printSnapshot(const apt_power_snapshot &snapshot) {
+    apt_decoded_power decoded{};
+    apt_decode_power(&snapshot, &decoded);
+    std::printf("Package PL1: %.2f W (%s, clamp %s)\n", decoded.pl1_watts,
+                decoded.pl1_enabled ? "enabled" : "disabled", decoded.pl1_clamp ? "on" : "off");
+    std::printf("Package PL2: %.2f W (%s, clamp %s)\n", decoded.pl2_watts,
+                decoded.pl2_enabled ? "enabled" : "disabled", decoded.pl2_clamp ? "on" : "off");
+    std::printf("Package limit lock: %s\n", decoded.locked ? "locked" : "unlocked");
+    std::printf("Undervolt lock status: unknown (no documented family-specific read-only bit)\n");
+    std::printf("These are package limits, not whole-computer power readings.\n");
+}
+
+static bool beginSession(io_connect_t connection, apt_session_result *result) {
+    apt_session_request request{};
+    request.magic = APT_POWER_MAGIC;
+    request.version = APT_POWER_VERSION;
+    request.size = sizeof(request);
     size_t output_size = sizeof(*result);
-    kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_FINISH_TRIAL,
-                                                      nullptr, 0, result, &output_size);
-    if (status != KERN_SUCCESS || output_size != sizeof(*result)) {
-        std::fprintf(stderr, "Restore request failed (0x%x); restoration was not confirmed.\n", status);
-        if (output_size == sizeof(*result) && result->magic == APT_POWER_MAGIC &&
-            result->version == APT_POWER_VERSION && result->size == sizeof(*result)) {
-            std::fprintf(stderr, "Restoration readback: 0x%016llx (saved original: 0x%016llx).\n",
-                         static_cast<unsigned long long>(result->restored_raw),
-                         static_cast<unsigned long long>(result->before_raw));
-        }
-        std::fprintf(stderr, "Closing the client makes one more restore attempt; verify the PL1/PL2 values afterward.\n");
-        return false;
-    }
-    if (result->magic != APT_POWER_MAGIC || result->version != APT_POWER_VERSION ||
-        result->size != sizeof(*result)) {
-        std::fprintf(stderr, "Invalid restore result from reader.\n");
+    kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_BEGIN_SESSION,
+                                                      &request, sizeof(request), result, &output_size);
+    if (status != KERN_SUCCESS || output_size != sizeof(*result) || !validSessionResult(*result) || !result->active) {
+        std::fprintf(stderr, "Power control session refused (0x%x).\n", status);
         return false;
     }
     return true;
 }
 
-static int runTrial(uint32_t pl1, uint32_t pl2, uint32_t seconds) {
-    if (geteuid() != 0) {
-        std::fprintf(stderr, "Temporary PL1/PL2 trials require administrator privileges. Use sudo for this command.\n");
-        return 77;
-    }
-    if (seconds == 0 || seconds > APT_TRIAL_MAX_SECONDS ||
-        pl1 < APT_TRIAL_MIN_WATTS || pl2 < APT_TRIAL_MIN_WATTS ||
-        pl1 > APT_TRIAL_MAX_WATTS || pl2 > APT_TRIAL_MAX_WATTS || pl1 > pl2) {
-        std::fprintf(stderr, "Trial bounds: %u <= PL1 <= PL2 <= %u W, duration 1..%u seconds.\n",
-                     APT_TRIAL_MIN_WATTS, APT_TRIAL_MAX_WATTS, APT_TRIAL_MAX_SECONDS);
-        return 64;
-    }
-    io_connect_t connection = openReader();
-    if (connection == IO_OBJECT_NULL) return 69;
-
-    apt_power_snapshot before{};
-    if (!readSnapshot(connection, &before)) {
-        IOServiceClose(connection);
-        return 65;
-    }
-    apt_decoded_power decoded{};
-    apt_decode_power(&before, &decoded);
-    if (decoded.locked || !decoded.pl1_enabled || !decoded.pl2_enabled) {
-        std::fprintf(stderr, "Trial refused: current package limits are locked or disabled.\n");
-        IOServiceClose(connection);
-        return 65;
-    }
-    std::printf("Before: PL1 %.2f W, PL2 %.2f W\n", decoded.pl1_watts, decoded.pl2_watts);
-
-    apt_trial_request request{};
+static bool setProfile(io_connect_t connection, uint32_t pl1, uint32_t tier,
+                       apt_session_result *result) {
+    uint32_t maximum_pl2 = 0;
+    if (!apt_profile_pl2(pl1, tier, APT_PROFILE_MAX_WATTS, &maximum_pl2)) return false;
+    apt_profile_request request{};
     request.magic = APT_POWER_MAGIC;
     request.version = APT_POWER_VERSION;
     request.size = sizeof(request);
     request.pl1_watts = pl1;
-    request.pl2_watts = pl2;
-    request.duration_seconds = seconds;
-    apt_trial_result trial{};
-    size_t output_size = sizeof(trial);
-    kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_BEGIN_TRIAL,
-                                                      &request, sizeof(request), &trial, &output_size);
-    if (status != KERN_SUCCESS || output_size != sizeof(trial) ||
-        trial.magic != APT_POWER_MAGIC || trial.version != APT_POWER_VERSION ||
-        trial.size != sizeof(trial)) {
-        std::fprintf(stderr, "Trial was refused or failed (0x%x).\n", status);
-        if (output_size == sizeof(trial) && trial.magic == APT_POWER_MAGIC &&
-            trial.version == APT_POWER_VERSION && trial.size == sizeof(trial)) {
-            printLimit("Applied readback:", trial.applied_raw, before.power_unit_msr);
-            printLimit("Recovery readback:", trial.restored_raw, before.power_unit_msr);
-            if (!apt_power_fields_equal(trial.restored_raw, trial.before_raw)) {
-                std::fprintf(stderr, "The original PL1/PL2 fields are not confirmed restored; client close will make one more attempt.\n");
-            }
-        }
+    request.turbo_tier = tier;
+    size_t output_size = sizeof(*result);
+    kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_SET_PROFILE,
+                                                      &request, sizeof(request), result, &output_size);
+    if (status != KERN_SUCCESS || output_size != sizeof(*result) || !validSessionResult(*result) ||
+        !result->active || result->pl1_watts != pl1 || result->turbo_tier != tier ||
+        result->pl2_watts < pl1 || result->pl2_watts > maximum_pl2) {
+        std::fprintf(stderr, "Profile update refused or failed (0x%x).\n", status);
+        return false;
+    }
+    return true;
+}
+
+static bool heartbeat(io_connect_t connection, apt_session_result *result) {
+    size_t output_size = sizeof(*result);
+    kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_HEARTBEAT,
+                                                      nullptr, 0, result, &output_size);
+    return status == KERN_SUCCESS && output_size == sizeof(*result) &&
+           validSessionResult(*result) && result->active;
+}
+
+static bool finishSession(io_connect_t connection, apt_session_result *result) {
+    size_t output_size = sizeof(*result);
+    kern_return_t status = IOConnectCallStructMethod(connection, APT_SELECTOR_FINISH_SESSION,
+                                                      nullptr, 0, result, &output_size);
+    if (status != KERN_SUCCESS || output_size != sizeof(*result) || !validSessionResult(*result)) {
+        std::fprintf(stderr, "Restore failed or was blocked (0x%x); verify the package limits.\n", status);
+        if (output_size == sizeof(*result) && validSessionResult(*result))
+            std::fprintf(stderr, "Restore active=%u, current MSR 0x%016llx, original MSR 0x%016llx\n",
+                         result->active, static_cast<unsigned long long>(result->current_raw),
+                         static_cast<unsigned long long>(result->original_raw));
+        return false;
+    }
+    return !result->active && apt_power_fields_equal(result->current_raw, result->original_raw);
+}
+
+static bool validTrial(uint32_t pl1, uint32_t tier, uint32_t seconds) {
+    uint32_t pl2 = 0;
+    return apt_profile_pl2(pl1, tier, APT_PROFILE_MAX_WATTS, &pl2) && seconds > 0 && seconds <= 20;
+}
+
+static int runTrial(uint32_t pl1, uint32_t tier, uint32_t seconds) {
+    if (!validTrial(pl1, tier, seconds)) {
+        std::fprintf(stderr, "Trial requires PL1 10..80 W in 5 W steps, tier 1..5, duration 1..20s.\n");
+        return 64;
+    }
+    if (geteuid() != 0) {
+        std::fprintf(stderr, "Power profile changes require administrator privileges; run with sudo.\n");
+        return 77;
+    }
+    io_connect_t connection = openReader();
+    if (connection == IO_OBJECT_NULL) return 69;
+    apt_power_snapshot before{};
+    apt_session_result state{};
+    int exit_code = 0;
+    if (!readSnapshot(connection, &before) || !beginSession(connection, &state)) {
         IOServiceClose(connection);
         return 65;
     }
-    printLimit("Applied readback:", trial.applied_raw, before.power_unit_msr);
+    printLimit("Before:", state.original_raw, before.power_unit_msr);
+    if (!setProfile(connection, pl1, tier, &state)) {
+        apt_session_result ignored{};
+        finishSession(connection, &ignored);
+        IOServiceClose(connection);
+        return 65;
+    }
+    printLimit("Applied readback:", state.current_raw, before.power_unit_msr);
 
     struct sigaction action{};
     struct sigaction old_int{};
@@ -150,54 +181,160 @@ static int runTrial(uint32_t pl1, uint32_t pl2, uint32_t seconds) {
     stop_requested = 0;
     for (uint32_t i = 0; i < seconds && !stop_requested; ++i) sleep(1);
 
-    apt_trial_result restored{};
-    const bool restored_ok = finish(connection, &restored);
-    if (restored_ok) {
-        printLimit("Restored readback:", restored.restored_raw, before.power_unit_msr);
-        if (restored.restored_raw != restored.before_raw) {
-            std::printf("Original PL1/PL2 fields were restored; other register bits changed during the trial.\n");
-        }
+    apt_session_result restored{};
+    if (finishSession(connection, &restored)) {
+        printLimit("Restored readback:", restored.current_raw, before.power_unit_msr);
+    } else {
+        exit_code = 70;
     }
     sigaction(SIGINT, &old_int, nullptr);
     sigaction(SIGTERM, &old_term, nullptr);
     IOServiceClose(connection);
-    return restored_ok && apt_power_fields_equal(restored.restored_raw, restored.before_raw) ? 0 : 70;
+    return exit_code;
+}
+
+static bool processControllerCommand(io_connect_t connection, const std::string &line,
+                                     uint64_t unitMSR, bool *finished) {
+    *finished = false;
+    if (line == "status") {
+        apt_power_snapshot snapshot{};
+        if (!readSnapshot(connection, &snapshot)) return false;
+        printSnapshot(snapshot);
+        return true;
+    }
+    if (line == "finish" || line == "quit") {
+        apt_session_result result{};
+        const bool restored = finishSession(connection, &result);
+        if (validSessionResult(result)) printLimit("Restored readback:", result.current_raw, unitMSR);
+        *finished = true;
+        return restored;
+    }
+    uint32_t pl1 = 0, tier = 0;
+    char extra = 0;
+    if (std::sscanf(line.c_str(), "set %u %u %c", &pl1, &tier, &extra) == 2) {
+        uint32_t pl2 = 0;
+        if (!apt_profile_pl2(pl1, tier, APT_PROFILE_MAX_WATTS, &pl2)) {
+            std::fprintf(stderr, "Invalid profile; PL1 must be 10..80 W in 5 W steps and tier 1..5.\n");
+            return false;
+        }
+        apt_session_result result{};
+        if (!setProfile(connection, pl1, tier, &result)) return false;
+        printLimit("Applied readback:", result.current_raw, unitMSR);
+        std::printf("Turbo power budget tier %u; PL2 target %u W.\n", tier, pl2);
+        return true;
+    }
+    std::fprintf(stderr, "Commands: status | set <PL1-W> <tier-1..5> | finish\n");
+    return false;
+}
+
+static int runController() {
+    if (geteuid() != 0) {
+        std::fprintf(stderr, "The controller requires administrator privileges; run with sudo.\n");
+        return 77;
+    }
+    io_connect_t connection = openReader();
+    if (connection == IO_OBJECT_NULL) return 69;
+    apt_power_snapshot snapshot{};
+    apt_session_result state{};
+    if (!readSnapshot(connection, &snapshot) || !beginSession(connection, &state)) {
+        IOServiceClose(connection);
+        return 65;
+    }
+    printSnapshot(snapshot);
+    std::printf("Session active; profiles renew a 30-second lease. Type status, set <PL1-W> <tier>, or finish.\n");
+    std::string pending;
+    bool finished = false;
+    int exit_code = 0;
+    struct sigaction action{};
+    struct sigaction old_int{};
+    struct sigaction old_term{};
+    action.sa_handler = request_stop;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, &old_int);
+    sigaction(SIGTERM, &action, &old_term);
+    stop_requested = 0;
+    while (!finished && !stop_requested) {
+        struct pollfd descriptor{};
+        descriptor.fd = STDIN_FILENO;
+        descriptor.events = POLLIN;
+        const int poll_status = poll(&descriptor, 1, APT_HEARTBEAT_SECONDS * 1000);
+        if (poll_status < 0 && errno == EINTR) continue;
+        if (poll_status < 0) {
+            std::perror("poll");
+            exit_code = 1;
+            break;
+        }
+        if (poll_status == 0) {
+            if (!heartbeat(connection, &state)) {
+                std::fprintf(stderr, "Session heartbeat failed; closing the connection to trigger restoration.\n");
+                exit_code = 70;
+                break;
+            }
+            continue;
+        }
+        char buffer[512];
+        const ssize_t count = read(STDIN_FILENO, buffer, sizeof(buffer));
+        if (count == 0) {
+            stop_requested = 1;
+            break;
+        }
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            std::perror("read");
+            exit_code = 1;
+            break;
+        }
+        pending.append(buffer, (size_t)count);
+        if (!heartbeat(connection, &state)) {
+            std::fprintf(stderr, "Session heartbeat failed; closing the connection to trigger restoration.\n");
+            exit_code = 70;
+            break;
+        }
+        size_t newline = 0;
+        while (!finished && (newline = pending.find('\n')) != std::string::npos) {
+            const std::string line = pending.substr(0, newline);
+            pending.erase(0, newline + 1);
+            const bool command_ok = processControllerCommand(connection, line, snapshot.power_unit_msr, &finished);
+            if (!command_ok && finished) exit_code = 70;
+            else if (!command_ok)
+                std::fprintf(stderr, "Command failed; session remains leased and will restore on timeout or disconnect.\n");
+        }
+    }
+    if (!finished) {
+        apt_session_result result{};
+        if (finishSession(connection, &result))
+            printLimit("Restored readback:", result.current_raw, snapshot.power_unit_msr);
+        else
+            exit_code = 70;
+    }
+    sigaction(SIGINT, &old_int, nullptr);
+    sigaction(SIGTERM, &old_term, nullptr);
+    IOServiceClose(connection);
+    return exit_code;
 }
 
 static int printCurrent() {
     io_connect_t connection = openReader();
     if (connection == IO_OBJECT_NULL) return 69;
     apt_power_snapshot snapshot{};
-    int result = 0;
-    if (readSnapshot(connection, &snapshot)) {
-        apt_decoded_power decoded{};
-        apt_decode_power(&snapshot, &decoded);
-        std::printf("Package PL1: %.2f W (%s, clamp %s)\n", decoded.pl1_watts,
-                    decoded.pl1_enabled ? "enabled" : "disabled", decoded.pl1_clamp ? "on" : "off");
-        std::printf("Package PL2: %.2f W (%s, clamp %s)\n", decoded.pl2_watts,
-                    decoded.pl2_enabled ? "enabled" : "disabled", decoded.pl2_clamp ? "on" : "off");
-        std::printf("Package limit lock: %s\n", decoded.locked ? "locked" : "unlocked");
-        std::printf("These are package limits, not whole-computer power readings.\n");
-    } else {
-        result = 65;
-    }
+    const bool ok = readSnapshot(connection, &snapshot);
+    if (ok) printSnapshot(snapshot);
     IOServiceClose(connection);
-    return result;
+    return ok ? 0 : 65;
 }
 
 int main(int argc, char **argv) {
-    if (argc == 1) {
-        return printCurrent();
-    }
+    if (argc == 1) return printCurrent();
+    if (argc == 2 && std::strcmp(argv[1], "controller") == 0) return runController();
     if (argc == 5 && std::strcmp(argv[1], "trial") == 0) {
-        uint32_t pl1 = 0, pl2 = 0, seconds = 0;
-        if (!parseUnsigned(argv[2], &pl1) || !parseUnsigned(argv[3], &pl2) ||
+        uint32_t pl1 = 0, tier = 0, seconds = 0;
+        if (!parseUnsigned(argv[2], &pl1) || !parseUnsigned(argv[3], &tier) ||
             !parseUnsigned(argv[4], &seconds)) {
-            std::fprintf(stderr, "Usage: apextune-power-probe trial <PL1-W> <PL2-W> <seconds>\n");
+            std::fprintf(stderr, "Usage: apextune-power-probe trial <PL1-W> <tier-1..5> <seconds>\n");
             return 64;
         }
-        return runTrial(pl1, pl2, seconds);
+        return runTrial(pl1, tier, seconds);
     }
-    std::fprintf(stderr, "Usage: apextune-power-probe [trial <PL1-W> <PL2-W> <seconds>]\n");
+    std::fprintf(stderr, "Usage: apextune-power-probe [controller | trial <PL1-W> <tier-1..5> <seconds>]\n");
     return 64;
 }

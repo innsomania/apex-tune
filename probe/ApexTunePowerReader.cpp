@@ -21,18 +21,27 @@ public:
     IOWorkLoop *getWorkLoop() const override { return workLoop; }
 
     IOReturn snapshot(ApexTunePowerClient *client, apt_power_snapshot *out);
-    IOReturn beginTrial(ApexTunePowerClient *client, const apt_trial_request *request,
-                        apt_trial_result *result);
-    IOReturn finishTrial(ApexTunePowerClient *client, apt_trial_result *result);
+    IOReturn beginSession(ApexTunePowerClient *client, const apt_session_request *request,
+                          apt_session_result *result);
+    IOReturn setProfile(ApexTunePowerClient *client, const apt_profile_request *request,
+                        apt_session_result *result);
+    IOReturn heartbeat(ApexTunePowerClient *client, apt_session_result *result);
+    IOReturn finishSession(ApexTunePowerClient *client, apt_session_result *result);
     IOReturn clientGone(ApexTunePowerClient *client);
 private:
     static IOReturn stopAction(OSObject *, void *, void *, void *, void *);
     static IOReturn snapshotAction(OSObject *, void *, void *, void *, void *);
-    static IOReturn beginAction(OSObject *, void *, void *, void *, void *);
-    static IOReturn finishAction(OSObject *, void *, void *, void *, void *);
+    static IOReturn beginSessionAction(OSObject *, void *, void *, void *, void *);
+    static IOReturn setProfileAction(OSObject *, void *, void *, void *, void *);
+    static IOReturn heartbeatAction(OSObject *, void *, void *, void *, void *);
+    static IOReturn finishSessionAction(OSObject *, void *, void *, void *, void *);
     static IOReturn goneAction(OSObject *, void *, void *, void *, void *);
     static void watchdogAction(OSObject *, IOTimerEventSource *);
     IOReturn restoreLease();
+    IOReturn armWatchdog();
+    void fillSessionResult(apt_session_result *result, uint64_t originalRaw,
+                           uint64_t currentRaw, bool active, uint32_t pl1Watts,
+                           uint32_t pl2Watts, uint32_t turboTier) const;
 
     IOWorkLoop *workLoop = nullptr;
     IOCommandGate *commandGate = nullptr;
@@ -40,6 +49,9 @@ private:
     ApexTunePowerClient *leaseClient = nullptr;
     uint64_t originalLimit = 0;
     uint64_t appliedLimit = 0;
+    uint32_t activePL1Watts = 0;
+    uint32_t activePL2Watts = 0;
+    uint32_t activeTurboTier = 0;
     bool stopping = false;
 };
 OSDefineMetaClassAndStructors(ApexTunePowerReader, IOService)
@@ -139,6 +151,7 @@ void ApexTunePowerReader::stop(IOService *provider) {
         leaseClient = nullptr;
         originalLimit = 0;
         appliedLimit = 0;
+        activePL1Watts = activePL2Watts = activeTurboTier = 0;
         formerClient->owner = nullptr;
         formerClient->release();
     }
@@ -176,13 +189,23 @@ bool ApexTunePowerClient::initWithTask(task_t task, void *securityID, UInt32 typ
 IOReturn ApexTunePowerReader::snapshot(ApexTunePowerClient *client, apt_power_snapshot *out) {
     return commandGate->runAction(snapshotAction, client, out);
 }
-IOReturn ApexTunePowerReader::beginTrial(ApexTunePowerClient *client,
-                                          const apt_trial_request *request,
-                                          apt_trial_result *result) {
-    return commandGate->runAction(beginAction, client, (void *)request, result);
+IOReturn ApexTunePowerReader::beginSession(ApexTunePowerClient *client,
+                                            const apt_session_request *request,
+                                            apt_session_result *result) {
+    return commandGate->runAction(beginSessionAction, client, (void *)request, result);
 }
-IOReturn ApexTunePowerReader::finishTrial(ApexTunePowerClient *client, apt_trial_result *result) {
-    return commandGate->runAction(finishAction, client, result);
+IOReturn ApexTunePowerReader::setProfile(ApexTunePowerClient *client,
+                                          const apt_profile_request *request,
+                                          apt_session_result *result) {
+    return commandGate->runAction(setProfileAction, client, (void *)request, result);
+}
+IOReturn ApexTunePowerReader::heartbeat(ApexTunePowerClient *client,
+                                         apt_session_result *result) {
+    return commandGate->runAction(heartbeatAction, client, result);
+}
+IOReturn ApexTunePowerReader::finishSession(ApexTunePowerClient *client,
+                                             apt_session_result *result) {
+    return commandGate->runAction(finishSessionAction, client, result);
 }
 IOReturn ApexTunePowerReader::clientGone(ApexTunePowerClient *client) {
     return commandGate->runAction(goneAction, client);
@@ -215,64 +238,137 @@ IOReturn ApexTunePowerReader::snapshotAction(OSObject *owner, void *arg0, void *
     snapshot.size = sizeof(snapshot);
     snapshot.power_unit_msr = readPowerUnitMSR();
     snapshot.package_power_limit_msr = readPackageLimitMSR();
+    snapshot.undervolt_lock_status = APT_UNDERVOLT_LOCK_UNKNOWN;
     bcopy(&snapshot, out, sizeof(snapshot));
     return kIOReturnSuccess;
 }
 
-IOReturn ApexTunePowerReader::beginAction(OSObject *owner, void *arg0, void *arg1,
-                                            void *arg2, void *) {
-    auto *self = OSDynamicCast(ApexTunePowerReader, owner);
-    auto *client = OSDynamicCast(ApexTunePowerClient, (OSObject *)arg0);
-    auto *request = (const apt_trial_request *)arg1;
-    auto *result = (apt_trial_result *)arg2;
-    if (!self || !client || !request || !result ||
-        request->magic != APT_POWER_MAGIC || request->version != APT_POWER_VERSION ||
-        request->size != sizeof(*request)) return kIOReturnBadArgument;
-    if (self->stopping) return kIOReturnNotReady;
-    if (self->leaseClient) return kIOReturnBusy;
-    const uint64_t unit = readPowerUnitMSR();
-    const uint64_t before = readPackageLimitMSR();
-    uint64_t target = 0;
-    if (!apt_build_trial_limit(unit, before, request->pl1_watts, request->pl2_watts,
-                               request->duration_seconds, &target)) return kIOReturnNotPermitted;
-    self->originalLimit = before;
-    self->appliedLimit = target;
-    self->leaseClient = client;
-    client->retain();
-    self->retain();
-    self->watchdog->enable();
-    if (self->watchdog->setTimeoutMS(APT_WATCHDOG_MAX_SECONDS * 1000) != kIOReturnSuccess) {
-        self->watchdog->disable();
-        self->leaseClient = nullptr;
-        self->originalLimit = 0;
-        self->appliedLimit = 0;
-        client->release();
-        self->release();
-        return kIOReturnError;
-    }
-    writePackageLimitMSR(target);
-    const uint64_t applied = readPackageLimitMSR();
-    self->appliedLimit = applied;
-    if (applied != target) {
-        const IOReturn restoreStatus = self->restoreLease();
-        const uint64_t restored = readPackageLimitMSR();
-        bzero(result, sizeof(*result));
-        result->magic = APT_POWER_MAGIC;
-        result->version = APT_POWER_VERSION;
-        result->size = sizeof(*result);
-        result->before_raw = before;
-        result->applied_raw = applied;
-        result->restored_raw = restored;
-        return restoreStatus == kIOReturnSuccess ? kIOReturnError : restoreStatus;
-    }
+IOReturn ApexTunePowerReader::armWatchdog() {
+    if (!watchdog) return kIOReturnNotReady;
+    watchdog->enable();
+    const IOReturn status = watchdog->setTimeoutMS(APT_WATCHDOG_MAX_SECONDS * 1000);
+    if (status != kIOReturnSuccess) watchdog->disable();
+    return status;
+}
+
+void ApexTunePowerReader::fillSessionResult(apt_session_result *result, uint64_t originalRaw,
+                                             uint64_t currentRaw, bool active,
+                                             uint32_t pl1Watts, uint32_t pl2Watts,
+                                             uint32_t turboTier) const {
     bzero(result, sizeof(*result));
     result->magic = APT_POWER_MAGIC;
     result->version = APT_POWER_VERSION;
     result->size = sizeof(*result);
-    result->duration_seconds = request->duration_seconds;
-    result->before_raw = before;
-    result->applied_raw = applied;
+    result->active = active ? 1u : 0u;
+    result->pl1_watts = pl1Watts;
+    result->pl2_watts = pl2Watts;
+    result->turbo_tier = turboTier;
+    result->original_raw = originalRaw;
+    result->current_raw = currentRaw;
+}
+
+IOReturn ApexTunePowerReader::beginSessionAction(OSObject *owner, void *arg0, void *arg1,
+                                                  void *arg2, void *) {
+    auto *self = OSDynamicCast(ApexTunePowerReader, owner);
+    auto *client = OSDynamicCast(ApexTunePowerClient, (OSObject *)arg0);
+    auto *request = (const apt_session_request *)arg1;
+    auto *result = (apt_session_result *)arg2;
+    if (!self || !client || !request || !result ||
+        !apt_valid_header(request->magic, request->version, request->size, sizeof(*request)))
+        return kIOReturnBadArgument;
+    if (self->stopping) return kIOReturnNotReady;
+    if (self->leaseClient) return kIOReturnBusy;
+    const uint64_t before = readPackageLimitMSR();
+    if ((before & APT_POWER_LOCK_MASK) != 0 ||
+        (before & APT_PL1_ENABLE_MASK) == 0 || (before & APT_PL2_ENABLE_MASK) == 0)
+        return kIOReturnNotPermitted;
+    self->originalLimit = before;
+    self->appliedLimit = before;
+    self->activePL1Watts = self->activePL2Watts = self->activeTurboTier = 0;
+    self->leaseClient = client;
+    client->retain();
+    self->retain();
+    if (self->armWatchdog() != kIOReturnSuccess) {
+        self->leaseClient = nullptr;
+        self->originalLimit = self->appliedLimit = 0;
+        client->release();
+        self->release();
+        return kIOReturnError;
+    }
+    self->fillSessionResult(result, before, before, true, 0, 0, 0);
     return kIOReturnSuccess;
+}
+
+IOReturn ApexTunePowerReader::setProfileAction(OSObject *owner, void *arg0, void *arg1,
+                                                void *arg2, void *) {
+    auto *self = OSDynamicCast(ApexTunePowerReader, owner);
+    auto *client = OSDynamicCast(ApexTunePowerClient, (OSObject *)arg0);
+    auto *request = (const apt_profile_request *)arg1;
+    auto *result = (apt_session_result *)arg2;
+    if (!self || !client || !request || !result ||
+        !apt_valid_header(request->magic, request->version, request->size, sizeof(*request)))
+        return kIOReturnBadArgument;
+    if (self->stopping) return kIOReturnNotReady;
+    if (!self->leaseClient) return kIOReturnNotFound;
+    if (self->leaseClient != client) return kIOReturnNotPermitted;
+    const uint64_t current = readPackageLimitMSR();
+    uint64_t target = 0;
+    uint32_t pl2Watts = 0;
+    if (!apt_build_profile_limit(readPowerUnitMSR(), self->originalLimit, current,
+                                 request->pl1_watts, request->turbo_tier,
+                                 &target, &pl2Watts)) return kIOReturnNotPermitted;
+    if (self->armWatchdog() != kIOReturnSuccess) {
+        const uint64_t original = self->originalLimit;
+        self->restoreLease();
+        const uint64_t restored = readPackageLimitMSR();
+        self->fillSessionResult(result, original, restored, self->leaseClient != nullptr, 0, 0, 0);
+        return kIOReturnError;
+    }
+    writePackageLimitMSR(target);
+    const uint64_t applied = readPackageLimitMSR();
+    if (applied != target) {
+        const uint64_t original = self->originalLimit;
+        const IOReturn restoreStatus = self->restoreLease();
+        const uint64_t restored = readPackageLimitMSR();
+        self->fillSessionResult(result, original, restored, self->leaseClient != nullptr, 0, 0, 0);
+        return restoreStatus == kIOReturnSuccess ? kIOReturnError : restoreStatus;
+    }
+    self->appliedLimit = applied;
+    self->activePL1Watts = request->pl1_watts;
+    self->activePL2Watts = pl2Watts;
+    self->activeTurboTier = request->turbo_tier;
+    self->fillSessionResult(result, self->originalLimit, applied, true,
+                            self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
+    return kIOReturnSuccess;
+}
+
+IOReturn ApexTunePowerReader::heartbeatAction(OSObject *owner, void *arg0, void *arg1,
+                                               void *, void *) {
+    auto *self = OSDynamicCast(ApexTunePowerReader, owner);
+    auto *client = OSDynamicCast(ApexTunePowerClient, (OSObject *)arg0);
+    auto *result = (apt_session_result *)arg1;
+    if (!self || !client || !result) return kIOReturnBadArgument;
+    if (self->stopping) return kIOReturnNotReady;
+    if (!self->leaseClient || self->leaseClient != client) return kIOReturnNotPermitted;
+    const uint64_t current = readPackageLimitMSR();
+    if ((current & APT_POWER_LOCK_MASK) != 0) {
+        self->watchdog->cancelTimeout();
+        self->watchdog->disable();
+        self->fillSessionResult(result, self->originalLimit, current, true,
+                                self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
+        return kIOReturnNotPermitted;
+    }
+    const IOReturn status = self->armWatchdog();
+    if (status != kIOReturnSuccess) {
+        const uint64_t original = self->originalLimit;
+        self->restoreLease();
+        const uint64_t restored = readPackageLimitMSR();
+        self->fillSessionResult(result, original, restored, self->leaseClient != nullptr, 0, 0, 0);
+        return status;
+    }
+    self->fillSessionResult(result, self->originalLimit, current, true,
+                            self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
+    return status;
 }
 
 IOReturn ApexTunePowerReader::restoreLease() {
@@ -299,33 +395,26 @@ IOReturn ApexTunePowerReader::restoreLease() {
     leaseClient = nullptr;
     originalLimit = 0;
     appliedLimit = 0;
+    activePL1Watts = activePL2Watts = activeTurboTier = 0;
     formerClient->release();
     release();
     return kIOReturnSuccess;
 }
 
-IOReturn ApexTunePowerReader::finishAction(OSObject *owner, void *arg0, void *arg1,
-                                             void *, void *) {
+IOReturn ApexTunePowerReader::finishSessionAction(OSObject *owner, void *arg0, void *arg1,
+                                                   void *, void *) {
     auto *self = OSDynamicCast(ApexTunePowerReader, owner);
     auto *client = OSDynamicCast(ApexTunePowerClient, (OSObject *)arg0);
-    auto *result = (apt_trial_result *)arg1;
-    if (!self) return kIOReturnBadArgument;
-    if (!self->leaseClient) return kIOReturnSuccess;
+    auto *result = (apt_session_result *)arg1;
+    if (!self || !client || !result) return kIOReturnBadArgument;
+    if (!self->leaseClient) return kIOReturnNotFound;
     if (self->stopping) return kIOReturnNotReady;
-    if (client && self->leaseClient != client) return kIOReturnNotPermitted;
-    const uint64_t before = self->originalLimit;
-    const uint64_t applied = self->appliedLimit;
+    if (self->leaseClient != client) return kIOReturnNotPermitted;
+    const uint64_t original = self->originalLimit;
     IOReturn status = self->restoreLease();
     const uint64_t restored = readPackageLimitMSR();
-    if (result) {
-        bzero(result, sizeof(*result));
-        result->magic = APT_POWER_MAGIC;
-        result->version = APT_POWER_VERSION;
-        result->size = sizeof(*result);
-        result->before_raw = before;
-        result->applied_raw = applied;
-        result->restored_raw = restored;
-    }
+    self->fillSessionResult(result, original, restored, self->leaseClient != nullptr,
+                            self->activePL1Watts, self->activePL2Watts, self->activeTurboTier);
     return status;
 }
 
@@ -360,22 +449,41 @@ IOReturn ApexTunePowerClient::externalMethod(uint32_t selector,
         if (status == kIOReturnSuccess) bcopy(&snapshot, args->structureOutput, sizeof(snapshot));
         return status;
     }
-    if (selector == APT_SELECTOR_BEGIN_TRIAL) {
-        if (!args->structureInput || args->structureInputSize != sizeof(apt_trial_request) ||
-            !args->structureOutput || args->structureOutputSize != sizeof(apt_trial_result))
+    if (selector == APT_SELECTOR_BEGIN_SESSION) {
+        if (!args->structureInput || args->structureInputSize != sizeof(apt_session_request) ||
+            !args->structureOutput || args->structureOutputSize != sizeof(apt_session_result))
             return kIOReturnBadArgument;
-        apt_trial_request request{};
-        apt_trial_result result{};
+        apt_session_request request{};
+        apt_session_result result{};
         bcopy(args->structureInput, &request, sizeof(request));
-        IOReturn status = owner->beginTrial(this, &request, &result);
+        IOReturn status = owner->beginSession(this, &request, &result);
         bcopy(&result, args->structureOutput, sizeof(result));
         return status;
     }
-    if (selector == APT_SELECTOR_FINISH_TRIAL) {
+    if (selector == APT_SELECTOR_SET_PROFILE) {
+        if (!args->structureInput || args->structureInputSize != sizeof(apt_profile_request) ||
+            !args->structureOutput || args->structureOutputSize != sizeof(apt_session_result))
+            return kIOReturnBadArgument;
+        apt_profile_request request{};
+        apt_session_result result{};
+        bcopy(args->structureInput, &request, sizeof(request));
+        IOReturn status = owner->setProfile(this, &request, &result);
+        bcopy(&result, args->structureOutput, sizeof(result));
+        return status;
+    }
+    if (selector == APT_SELECTOR_HEARTBEAT) {
         if (args->structureInputSize != 0 || !args->structureOutput ||
-            args->structureOutputSize != sizeof(apt_trial_result)) return kIOReturnBadArgument;
-        apt_trial_result result{};
-        IOReturn status = owner->finishTrial(this, &result);
+            args->structureOutputSize != sizeof(apt_session_result)) return kIOReturnBadArgument;
+        apt_session_result result{};
+        IOReturn status = owner->heartbeat(this, &result);
+        bcopy(&result, args->structureOutput, sizeof(result));
+        return status;
+    }
+    if (selector == APT_SELECTOR_FINISH_SESSION) {
+        if (args->structureInputSize != 0 || !args->structureOutput ||
+            args->structureOutputSize != sizeof(apt_session_result)) return kIOReturnBadArgument;
+        apt_session_result result{};
+        IOReturn status = owner->finishSession(this, &result);
         bcopy(&result, args->structureOutput, sizeof(result));
         return status;
     }
