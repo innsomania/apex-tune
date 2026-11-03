@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <poll.h>
 #include <string>
 #include <unistd.h>
@@ -313,6 +314,88 @@ static int runController() {
     return exit_code;
 }
 
+static double wattsFromRaw(uint64_t raw, uint64_t unitMSR, uint64_t mask, unsigned shift) {
+    const uint64_t units = (raw & mask) >> shift;
+    return static_cast<double>(units) / static_cast<double>(1ULL << (unitMSR & 0x0f));
+}
+
+static void emitMachineState(const char *event, const apt_session_result &state,
+                             uint64_t unitMSR, bool active) {
+    std::printf("{\"event\":\"%s\",\"active\":%s,\"pl1_watts\":%u,\"pl2_watts\":%u,"
+                "\"tier\":%u,\"actual_pl1_watts\":%.3f,\"actual_pl2_watts\":%.3f,"
+                "\"original_pl1_watts\":%.3f,\"original_pl2_watts\":%.3f}\n",
+                event, active ? "true" : "false", state.pl1_watts, state.pl2_watts,
+                state.turbo_tier,
+                wattsFromRaw(state.current_raw, unitMSR, APT_PL1_POWER_MASK, 0),
+                wattsFromRaw(state.current_raw, unitMSR, APT_PL2_POWER_MASK, 32),
+                wattsFromRaw(state.original_raw, unitMSR, APT_PL1_POWER_MASK, 0),
+                wattsFromRaw(state.original_raw, unitMSR, APT_PL2_POWER_MASK, 32));
+    std::fflush(stdout);
+}
+
+static int runMachineController() {
+    if (geteuid() != 0) {
+        std::fprintf(stderr, "The control mode requires administrator privileges; run it explicitly as root.\n");
+        return 77;
+    }
+    io_connect_t connection = openReader();
+    if (connection == IO_OBJECT_NULL) return 69;
+    apt_power_snapshot snapshot{};
+    apt_session_result state{};
+    if (!readSnapshot(connection, &snapshot) || !beginSession(connection, &state)) {
+        IOServiceClose(connection);
+        return 65;
+    }
+    emitMachineState("ready", state, snapshot.power_unit_msr, true);
+    std::string line;
+    int exit_code = 0;
+    bool finished = false;
+    while (!finished && std::getline(std::cin, line)) {
+        if (line == "heartbeat") {
+            if (!heartbeat(connection, &state)) {
+                std::fprintf(stderr, "Session heartbeat failed.\n");
+                exit_code = 70;
+                break;
+            }
+            emitMachineState("heartbeat", state, snapshot.power_unit_msr, true);
+        } else if (line == "finish") {
+            apt_session_result restored{};
+            const bool ok = finishSession(connection, &restored);
+            emitMachineState(ok ? "restored" : "restore_failed", restored,
+                             snapshot.power_unit_msr, restored.active != 0);
+            if (!ok) exit_code = 70;
+            finished = true;
+        } else {
+            uint32_t pl1 = 0, tier = 0;
+            char extra = 0;
+            if (std::sscanf(line.c_str(), "set %u %u %c", &pl1, &tier, &extra) != 2) {
+                std::printf("{\"event\":\"error\",\"message\":\"invalid command\"}\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (!setProfile(connection, pl1, tier, &state)) {
+                std::printf("{\"event\":\"error\",\"message\":\"profile refused\"}\n");
+                std::fflush(stdout);
+                apt_session_result restored{};
+                if (!finishSession(connection, &restored)) exit_code = 70;
+                else emitMachineState("restored", restored, snapshot.power_unit_msr, false);
+                finished = true;
+                break;
+            }
+            emitMachineState("applied", state, snapshot.power_unit_msr, true);
+        }
+    }
+    if (!finished) {
+        apt_session_result restored{};
+        if (finishSession(connection, &restored))
+            emitMachineState("restored", restored, snapshot.power_unit_msr, false);
+        else
+            exit_code = 70;
+    }
+    IOServiceClose(connection);
+    return exit_code;
+}
+
 static int printCurrent() {
     io_connect_t connection = openReader();
     if (connection == IO_OBJECT_NULL) return 69;
@@ -324,8 +407,11 @@ static int printCurrent() {
 }
 
 int main(int argc, char **argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     if (argc == 1) return printCurrent();
     if (argc == 2 && std::strcmp(argv[1], "controller") == 0) return runController();
+    if (argc == 3 && std::strcmp(argv[1], "controller") == 0 &&
+        std::strcmp(argv[2], "--machine") == 0) return runMachineController();
     if (argc == 5 && std::strcmp(argv[1], "trial") == 0) {
         uint32_t pl1 = 0, tier = 0, seconds = 0;
         if (!parseUnsigned(argv[2], &pl1) || !parseUnsigned(argv[3], &tier) ||
@@ -335,6 +421,6 @@ int main(int argc, char **argv) {
         }
         return runTrial(pl1, tier, seconds);
     }
-    std::fprintf(stderr, "Usage: apextune-power-probe [controller | trial <PL1-W> <tier-1..5> <seconds>]\n");
+    std::fprintf(stderr, "Usage: apextune-power-probe [controller [--machine] | trial <PL1-W> <tier-1..5> <seconds>]\n");
     return 64;
 }
