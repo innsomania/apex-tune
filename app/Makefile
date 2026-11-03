@@ -22,7 +22,7 @@ $(PROBE):
 	$(MAKE) -C ../probe all
 
 $(BUILD)/policy-tests: Tests.swift Policy.swift Simulation.swift | $(BUILD)
-	$(SWIFTC) $(SWIFTFLAGS) Tests.swift Policy.swift Simulation.swift -o $@
+	$(SWIFTC) $(SWIFTFLAGS) Tests.swift Policy.swift Simulation.swift -framework AppKit -o $@
 
 $(BUILD):
 	mkdir -p $(BUILD)

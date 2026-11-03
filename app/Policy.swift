@@ -1,4 +1,20 @@
 import Foundation
+import AppKit
+
+enum ControlRuntime {
+    static let powerMetricsArguments = [
+        "--samplers", "cpu_power,gpu_power,smc", "-i", "1000", "-b", "1"
+    ]
+
+    static func scheduleControlTimer(on runLoop: RunLoop = .main,
+                                     interval: TimeInterval,
+                                     handler: @escaping @Sendable (Timer) -> Void) -> Timer {
+        let timer = Timer(timeInterval: interval, repeats: true, block: handler)
+        runLoop.add(timer, forMode: .common)
+        runLoop.add(timer, forMode: .eventTracking)
+        return timer
+    }
+}
 
 struct Profile: Equatable {
     let pl1: Int

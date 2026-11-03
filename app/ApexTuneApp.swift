@@ -111,7 +111,7 @@ final class PowerMetricsMonitor: @unchecked Sendable {
 
     func start() throws {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/powermetrics")
-        process.arguments = ["--samplers", "cpu_power,gpu_power,smc", "-i", "1000"]
+        process.arguments = ControlRuntime.powerMetricsArguments
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -171,6 +171,7 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
     private var pendingProfileAt: Date?
     private var releaseStarted = false
     private var quitAfterRelease = false
+    private var lastLoggedPowerSampleAt = Date.distantPast
 
     init(control: Bool) {
         controlRequested = control
@@ -188,7 +189,7 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         statusItem.button?.title = "ApexTune · Observe"
         if controlRequested { startControl() }
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        timer = ControlRuntime.scheduleControlTimer(interval: 1) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
         tick()
@@ -223,6 +224,12 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
                                      power: sample, timestamp: Date())
             self.packageItem.title = String(format: "Package power: %.1f W", sample.packageWatts)
             self.temperatureItem.title = String(format: "CPU temperature: %.1f °C", sample.cpuTemperatureC)
+            let now = Date()
+            if self.controlRequested && now.timeIntervalSince(self.lastLoggedPowerSampleAt) >= 10 {
+                self.lastLoggedPowerSampleAt = now
+                self.logControl(String(format: "sensor package=%.1fW cpu=%.1fC", sample.packageWatts,
+                                        sample.cpuTemperatureC))
+            }
         }
         monitor.onExit = { [weak self] in
             guard let self, self.controlRequested, !self.releaseStarted else { return }
@@ -334,6 +341,7 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             controller.begin(originalPL1: originalPL1, originalPL2: originalPL2)
             hysteresis.confirmBaseline(pl1: originalPL1, pl2: originalPL2)
             modeItem.title = "Mode: automatic control (sensor-gated)"
+            logControl(String(format: "session ready; baseline PL1=%.1fW PL2=%.1fW", actual1, actual2))
             lastHeartbeat = Date()
             heartbeatSentAt = nil
         } else if name == "applied", let pl1 = event["pl1_watts"] as? Int,
@@ -342,11 +350,14 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             controller.applyConfirmed(profile)
             hysteresis.confirmApplied(profile)
             pendingProfileAt = nil
+            logControl("profile confirmed PL1=\(pl1)W tier=\(tier) PL2=\(pl2)W")
         } else if name == "heartbeat" {
             heartbeatSentAt = nil
+            logControl("kernel lease heartbeat confirmed")
         } else if name == "restored" {
             controller.restored()
             actualItem.title = String(format: "Actual limits restored: PL1 %.1f W · PL2 %.1f W", actual1, actual2)
+            logControl(String(format: "baseline restored PL1=%.1fW PL2=%.1fW", actual1, actual2))
             finishControl(reason: "Restored Apple's saved package limits")
         } else if name == "restore_failed" {
             actualItem.title = "Restore failed; check probe output and current limits"
@@ -362,12 +373,21 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
     private func releaseControl(reason: String) {
         guard controlRequested, !releaseStarted else { return }
         releaseStarted = true
+        logControl("releasing control: \(reason)")
         modeItem.title = "Mode: restoring · \(reason)"
         probe?.send("finish")
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self, self.controlRequested, self.releaseStarted else { return }
             self.probe?.stopTransport()
             self.finishControl(reason: reason + " (connection closed for kernel cleanup)")
+        }
+    }
+
+    private func logControl(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[ApexTune \(timestamp)] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            try? FileHandle.standardError.write(contentsOf: data)
         }
     }
 

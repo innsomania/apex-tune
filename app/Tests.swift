@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 private func check(_ value: @autoclosure () -> Bool, _ message: String) {
     if !value() { fatalError("FAILED: \(message)") }
@@ -29,6 +29,24 @@ enum ApexTunePolicyTests {
     }
 
     static func main() {
+        check(ControlRuntime.powerMetricsArguments == [
+            "--samplers", "cpu_power,gpu_power,smc", "-i", "1000", "-b", "1"
+        ], "powermetrics uses supported one-second sampling and line-buffered output")
+        let menuTrackingMode = RunLoop.Mode.eventTracking
+        let controlTick = DispatchSemaphore(value: 0)
+        let controlTimer = ControlRuntime.scheduleControlTimer(
+            interval: 0.01, handler: { _ in controlTick.signal() })
+        let menuTrackingDeadline = Date().addingTimeInterval(0.12)
+        while Date() < menuTrackingDeadline {
+            _ = RunLoop.main.run(mode: menuTrackingMode,
+                                 before: Date().addingTimeInterval(0.02))
+        }
+        controlTimer.invalidate()
+        let firstControlTick = controlTick.wait(timeout: .now()) == .success
+        let secondControlTick = controlTick.wait(timeout: .now()) == .success
+        check(firstControlTick && secondControlTick,
+              "control timer continues in menu-tracking run-loop mode")
+
         check(ProfilePolicy.pl1Levels.count == 15, "15 PL1 values")
         check(ProfilePolicy.pl1Levels.first == 10 && ProfilePolicy.pl1Levels.last == 80,
               "10..80 W profile limits")
