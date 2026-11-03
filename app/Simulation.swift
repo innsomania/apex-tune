@@ -23,6 +23,11 @@ struct SimulationReport {
             ("critical thermal", frame(0.90, 95, 70, thermal: .critical), 100, 125)
         ]
         for (name, sensor, baselinePL1, baselinePL2) in scenarios {
+            let stalePower = sensor.power.map { now.timeIntervalSince($0.timestamp) > 4 } ?? true
+            if stalePower || sensor.thermal == .critical {
+                rows.append("\(name): sensor fallback PL1 10 W, tier 1, PL2 10 W; controller lease held")
+                continue
+            }
             let decision = ProfilePolicy.proposal(for: sensor,
                                                  baselinePL1: baselinePL1,
                                                  baselinePL2: baselinePL2)

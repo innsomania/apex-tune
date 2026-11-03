@@ -165,12 +165,14 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
     private var controller = ControllerLifecycle()
     private var hysteresis = ProfileHysteresis()
     private var turboBurstBudget = TurboBurstBudget()
+    private var sensorFallback = SensorFallbackRecovery()
     private var controlRequested = false
     private var controlStartedAt = Date()
     private var cpuLastSampleAt = Date.distantPast
     private var lastHeartbeat = Date.distantPast
     private var heartbeatSentAt: Date?
     private var pendingProfileAt: Date?
+    private var pendingProfileTarget: Profile?
     private var releaseStarted = false
     private var quitAfterRelease = false
     private var lastLoggedPowerSampleAt = Date.distantPast
@@ -184,6 +186,10 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
     private var latestProposal: Profile?
     private var latestPowerSample: PowerSample?
     private var statusWriteFailed = false
+    private var powermetricsRetryAttempt = 0
+    private var powermetricsConsecutiveSamples = 0
+    private var powermetricsRetryWorkItem: DispatchWorkItem?
+    private var confirmedSafeFallback = false
 
     init(control: Bool, headless: Bool = false, statusOnly: Bool = false,
          statusStore: ServiceStatusStore = .installed,
@@ -292,7 +298,14 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
         do { try child.start() }
         catch { releaseControl(reason: error.localizedDescription); return }
 
+        startPowerMetricsMonitor()
+    }
+
+    private func startPowerMetricsMonitor() {
+        guard controlRequested, !releaseStarted, powerMonitor == nil,
+              powermetricsRetryWorkItem == nil else { return }
         let monitor = PowerMetricsMonitor()
+        powermetricsConsecutiveSamples = 0
         monitor.onSample = { [weak self] sample in
             guard let self else { return }
             guard let sample else {
@@ -309,6 +322,11 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             self.packageItem.title = String(format: "Package power: %.1f W", sample.packageWatts)
             self.latestPowerSample = sample
             self.temperatureItem.title = String(format: "CPU die temperature: %.1f °C", sample.cpuTemperatureC)
+            self.powermetricsConsecutiveSamples += 1
+            if self.powermetricsConsecutiveSamples >= 5 {
+                self.powermetricsRetryAttempt = 0
+                self.powermetricsConsecutiveSamples = 0
+            }
             let now = Date()
             if self.controlRequested && now.timeIntervalSince(self.lastLoggedPowerSampleAt) >= 10 {
                 self.lastLoggedPowerSampleAt = now
@@ -317,12 +335,66 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             }
         }
         monitor.onExit = { [weak self] in
-            guard let self, self.controlRequested, !self.releaseStarted else { return }
-            self.releaseControl(reason: "powermetrics stopped")
+            guard let self else { return }
+            self.powerMetricsExited(monitor)
         }
         powerMonitor = monitor
         do { try monitor.start() }
-        catch { releaseControl(reason: "powermetrics failed to start: \(error.localizedDescription)") }
+        catch {
+            powerMonitor = nil
+            logControl("powermetrics start failed: \(error.localizedDescription)")
+            schedulePowerMetricsRetry()
+        }
+    }
+
+    private func powerMetricsExited(_ monitor: PowerMetricsMonitor) {
+        guard controlRequested, !releaseStarted, powerMonitor === monitor else { return }
+        powerMonitor = nil
+        powermetricsConsecutiveSamples = 0
+        latestPowerSample = nil
+        if let frame {
+            self.frame = SensorFrame(cpuLoad: frame.cpuLoad, thermal: thermalLevel,
+                                     power: nil, timestamp: Date())
+        }
+        packageItem.title = "Package power: unavailable"
+        temperatureItem.title = "CPU die temperature: unavailable"
+        logControl("powermetrics exited; retaining safe controller lease and retrying")
+        schedulePowerMetricsRetry()
+    }
+
+    private func schedulePowerMetricsRetry() {
+        guard controlRequested, !releaseStarted, powermetricsRetryWorkItem == nil else { return }
+        let delay = min(30, 1 << min(powermetricsRetryAttempt, 4))
+        powermetricsRetryAttempt += 1
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.powermetricsRetryWorkItem = nil
+                self.startPowerMetricsMonitor()
+            }
+        }
+        powermetricsRetryWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(delay), execute: item)
+    }
+
+    private func requestSafeFallback(now: Date, reason: String) {
+        currentServiceState = .controlling
+        serviceMessage = "Sensor fallback: \(reason)"
+        let safeProfile = SensorFallbackRecovery.safeProfile
+        latestProposal = safeProfile
+        _ = turboBurstBudget.constrain(safeProfile, cpuTemperatureC: nil,
+                                      thermal: .unknown, now: now)
+        if !confirmedSafeFallback, pendingProfileTarget != safeProfile {
+            sendProfile(safeProfile, at: now)
+        }
+    }
+
+    private func sendHeartbeatIfNeeded(now: Date) {
+        guard SensorFallbackRecovery.heartbeatIsDue(lastSentAt: lastHeartbeat, now: now),
+              heartbeatSentAt == nil else { return }
+        probe?.send("heartbeat")
+        lastHeartbeat = now
+        heartbeatSentAt = now
     }
 
     private var thermalLevel: ThermalLevel {
@@ -342,21 +414,8 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             refreshDaemonStatus()
             return
         }
-        if controlRequested, !releaseStarted {
-            if probe == nil || (!controller.isActive && now.timeIntervalSince(controlStartedAt) > 5) {
-                releaseControl(reason: "Control session did not become ready")
-            }
-            if let pendingProfileAt, now.timeIntervalSince(pendingProfileAt) > 4 {
-                releaseControl(reason: "Profile acknowledgement timed out")
-            }
-            if let heartbeatSentAt, now.timeIntervalSince(heartbeatSentAt) > 4 {
-                releaseControl(reason: "Kernel lease heartbeat timed out")
-            }
-            if now.timeIntervalSince(cpuLastSampleAt) > 4,
-               now.timeIntervalSince(controlStartedAt) > 5 {
-                releaseControl(reason: "CPU load sensor is stale")
-            }
-        }
+
+        // Refresh host CPU ticks before deciding whether that sensor is stale.
         if let load = cpuSampler.sample() {
             cpuLastSampleAt = now
             let oldPower = frame?.power
@@ -364,7 +423,8 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             cpuItem.title = String(format: "CPU load: %.0f%%", load * 100)
         }
         thermalItem.title = "Thermal: \(thermalLevel.rawValue)"
-        if now.timeIntervalSince(cpuLastSampleAt) > 4 {
+        let cpuFresh = SensorFallbackRecovery.sampleIsFresh(cpuLastSampleAt, now: now)
+        if !cpuFresh {
             cpuItem.title = "CPU load: unavailable (stale)"
             if !controlRequested { proposedItem.title = "Proposed profile: unavailable (CPU load stale)" }
         }
@@ -373,53 +433,84 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             packageItem.title = "Package power: unavailable (stale)"
             temperatureItem.title = "CPU die temperature: unavailable (stale)"
         }
+
+        if controlRequested, !releaseStarted {
+            if probe == nil || (!controller.isActive && now.timeIntervalSince(controlStartedAt) > 5) {
+                releaseControl(reason: "Control session did not become ready")
+                return
+            }
+            if let pendingProfileAt, now.timeIntervalSince(pendingProfileAt) > 4 {
+                releaseControl(reason: "Profile acknowledgement timed out")
+                return
+            }
+            if let heartbeatSentAt, now.timeIntervalSince(heartbeatSentAt) > 4 {
+                releaseControl(reason: "Kernel lease heartbeat timed out")
+                return
+            }
+
+            let power = latestPowerSample
+            let powerFresh = power.map {
+                SensorFallbackRecovery.sampleIsFresh($0.timestamp, now: now)
+            } ?? false
+            let sensorsSafe = SensorFallbackRecovery.sensorsAreSafe(
+                cpuFresh: cpuFresh, powerFresh: powerFresh, thermal: thermalLevel,
+                cpuTemperatureC: power?.cpuTemperatureC)
+            let recovered = sensorFallback.observe(isSafe: sensorsSafe,
+                sampleAt: sensorsSafe ? power?.timestamp : nil)
+            if !recovered {
+                let reason: String
+                if !cpuFresh { reason = "CPU load stale or unavailable" }
+                else if !powerFresh { reason = "power or CPU die sensor stale or unavailable" }
+                else if thermalLevel == .critical { reason = "critical thermal state" }
+                else if thermalLevel == .unknown { reason = "thermal state unknown" }
+                else { reason = "CPU die temperature is at least 75 °C" }
+                requestSafeFallback(now: now, reason: reason)
+                sendHeartbeatIfNeeded(now: now)
+                return
+            }
+
+            guard let frame,
+                  let proposal = ProfilePolicy.proposal(for: frame,
+                    baselinePL1: originalPL1, baselinePL2: originalPL2, requirePower: true),
+                  let power else {
+                sensorFallback.observe(isSafe: false, sampleAt: nil)
+                requestSafeFallback(now: now, reason: "sensor sample failed validation")
+                sendHeartbeatIfNeeded(now: now)
+                return
+            }
+            latestProposal = proposal
+            proposedItem.title = "Proposed: PL1 \(proposal.pl1) W · tier \(proposal.tier) · PL2 \(proposal.pl2) W"
+            let thermalReduction = thermalLevel == .serious || power.cpuTemperatureC >= 75 ||
+                power.packageWatts >= 75
+            let turboDecision = turboBurstBudget.constrain(proposal,
+                cpuTemperatureC: power.cpuTemperatureC, thermal: thermalLevel, now: now)
+            latestProposal = turboDecision.profile
+            if let change = hysteresis.observe(turboDecision.profile, now: now,
+                                               thermalReduction: thermalReduction,
+                                               immediateReduction: power.cpuTemperatureC >= 80 ||
+                                                   turboDecision.closeImmediately),
+               pendingProfileAt == nil {
+                sendProfile(change, at: now)
+            }
+            sendHeartbeatIfNeeded(now: now)
+            return
+        }
+
         if let frame {
-            if let proposal = ProfilePolicy.proposal(for: frame,
-                                                      baselinePL1: controlRequested ? originalPL1 : 80,
-                                                      baselinePL2: controlRequested ? originalPL2 : 80,
-                                                      requirePower: controlRequested) {
+            if let proposal = ProfilePolicy.proposal(for: frame) {
                 latestProposal = proposal
                 proposedItem.title = "Proposed: PL1 \(proposal.pl1) W · tier \(proposal.tier) · PL2 \(proposal.pl2) W"
-                if controlRequested, !releaseStarted {
-                    guard let power = frame.power, now.timeIntervalSince(power.timestamp) <= 4 else {
-                        if now.timeIntervalSince(controlStartedAt) > 5 { releaseControl(reason: "Power or temperature sensor is stale") }
-                        return
-                    }
-                    controller.sensorSeen(at: power.timestamp)
-                    if controller.shouldRelease(now: now, thermal: thermalLevel) {
-                        releaseControl(reason: thermalLevel == .critical ? "Critical thermal state" : "Sensors became stale")
-                        return
-                    }
-                    let thermalReduction = thermalLevel == .serious || power.cpuTemperatureC >= 75 ||
-                        power.packageWatts >= 75
-                    let turboDecision = turboBurstBudget.constrain(proposal,
-                        cpuTemperatureC: power.cpuTemperatureC, thermal: thermalLevel, now: now)
-                    latestProposal = turboDecision.profile
-                    if let change = hysteresis.observe(turboDecision.profile, now: now,
-                                                       thermalReduction: thermalReduction,
-                                                       immediateReduction: power.cpuTemperatureC >= 80 ||
-                                                           turboDecision.closeImmediately),
-                       !releaseStarted, pendingProfileAt == nil {
-                        probe?.send("set \(change.pl1) \(change.tier)")
-                        pendingProfileAt = now
-                    }
-                    if now.timeIntervalSince(lastHeartbeat) >= 10 {
-                        probe?.send("heartbeat")
-                        lastHeartbeat = now
-                        heartbeatSentAt = now
-                    }
-                }
             } else {
                 latestProposal = nil
                 proposedItem.title = "Proposed profile: unavailable (sensor/baseline)"
-                if controlRequested && !releaseStarted && now.timeIntervalSince(controlStartedAt) > 5 {
-                    releaseControl(reason: "Required sensors or safe baseline unavailable")
-                }
             }
         }
-        if controlRequested, !releaseStarted, thermalLevel == .critical {
-            releaseControl(reason: "Critical thermal state")
-        }
+    }
+
+    private func sendProfile(_ profile: Profile, at time: Date) {
+        probe?.send("set \(profile.pl1) \(profile.tier)")
+        pendingProfileTarget = profile
+        pendingProfileAt = time
     }
 
     private func handleProbeEvent(_ event: [String: Any]) {
@@ -443,20 +534,29 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
             controller.begin(originalPL1: originalPL1, originalPL2: originalPL2)
             hysteresis.confirmBaseline(pl1: originalPL1, pl2: originalPL2)
             currentServiceState = .controlling
-            serviceMessage = "Automatic power control active"
+            serviceMessage = "Sensor fallback: waiting for fresh safe readings"
             modeItem.title = "Mode: automatic control (sensor-gated)"
             logControl(String(format: "session ready; baseline PL1=%.1fW PL2=%.1fW", actual1, actual2))
             lastHeartbeat = Date()
             heartbeatSentAt = nil
+            sensorFallback = SensorFallbackRecovery()
+            confirmedSafeFallback = false
+            sendProfile(SensorFallbackRecovery.safeProfile, at: Date())
         } else if name == "applied", let pl1 = event["pl1_watts"] as? Int,
                   let tier = event["tier"] as? Int, let pl2 = event["pl2_watts"] as? Int {
             let profile = Profile(pl1: pl1, tier: tier, pl2: pl2)
             controller.applyConfirmed(profile)
             hysteresis.confirmApplied(profile)
             turboBurstBudget.confirmApplied(profile, at: Date())
-            pendingProfileAt = nil
+            if pendingProfileTarget == profile {
+                pendingProfileAt = nil
+                pendingProfileTarget = nil
+            }
+            confirmedSafeFallback = profile == Profile(pl1: 10, tier: 1, pl2: 10)
             currentServiceState = .controlling
-            serviceMessage = "Automatic power control active"
+            if !sensorFallback.isDegraded {
+                serviceMessage = "Automatic power control active"
+            }
             logControl("profile confirmed PL1=\(pl1)W tier=\(tier) PL2=\(pl2)W")
         } else if name == "heartbeat" {
             heartbeatSentAt = nil
@@ -507,6 +607,8 @@ final class ApexTuneApp: NSObject, NSApplicationDelegate {
     }
 
     private func finishControl(reason: String) {
+        powermetricsRetryWorkItem?.cancel()
+        powermetricsRetryWorkItem = nil
         powerMonitor?.stop()
         powerMonitor = nil
         probe?.stopTransport()

@@ -120,14 +120,14 @@ struct ProfileHysteresis {
             return next
         }
 
-        guard now.timeIntervalSince(lastChange) >= 1 else { return nil }
-        let steppedPL1 = min(next.pl1, applied.pl1 + 10)
+        guard now.timeIntervalSince(lastChange) >= 3 else { return nil }
+        let steppedPL1 = min(next.pl1, applied.pl1 + 5)
         var steppedTier = next.tier
         var stepped: Profile?
         while steppedTier >= 1 {
             if let attempt = ProfilePolicy.fixedProfile(pl1: steppedPL1, tier: steppedTier,
                                                          baselinePL1: 80, baselinePL2: 80),
-               attempt.pl2 <= min(applied.pl2 + 10, next.pl2) {
+               attempt.pl2 <= min(applied.pl2 + 5, next.pl2) {
                 stepped = attempt
                 break
             }
@@ -258,7 +258,6 @@ struct PowerMetricsParser {
 struct ControllerLifecycle {
     private(set) var isActive = false
     private(set) var applied: Profile?
-    private(set) var lastSensorTime: Date?
 
     mutating func begin(originalPL1: Int, originalPL2: Int) {
         isActive = true
@@ -267,18 +266,58 @@ struct ControllerLifecycle {
     }
 
     mutating func applyConfirmed(_ profile: Profile) { applied = profile }
-    mutating func sensorSeen(at time: Date) { lastSensorTime = time }
-
-    mutating func shouldRelease(now: Date, thermal: ThermalLevel) -> Bool {
-        guard isActive else { return false }
-        if thermal == .critical { return true }
-        guard let lastSensorTime else { return true }
-        return now.timeIntervalSince(lastSensorTime) > 4
-    }
 
     mutating func restored() {
         isActive = false
         applied = nil
-        lastSensorTime = nil
+    }
+}
+
+struct SensorFallbackRecovery {
+    static let safeProfile = Profile(pl1: 10, tier: 1, pl2: 10)
+    private(set) var isDegraded = true
+    private(set) var consecutiveFreshSamples = 0
+    private var lastCountedSample: Date?
+    private var recoveryStartedAt: Date?
+
+    @discardableResult
+    mutating func observe(isSafe: Bool, sampleAt: Date?, requiredSamples: Int = 5,
+                          requiredDuration: TimeInterval = 10) -> Bool {
+        guard isSafe, let sampleAt else {
+            isDegraded = true
+            consecutiveFreshSamples = 0
+            lastCountedSample = nil
+            recoveryStartedAt = nil
+            return false
+        }
+        guard isDegraded else { return true }
+        guard lastCountedSample != sampleAt else { return false }
+        if recoveryStartedAt == nil { recoveryStartedAt = sampleAt }
+        lastCountedSample = sampleAt
+        consecutiveFreshSamples += 1
+        if consecutiveFreshSamples >= requiredSamples,
+           sampleAt.timeIntervalSince(recoveryStartedAt ?? sampleAt) >= requiredDuration {
+            isDegraded = false
+            consecutiveFreshSamples = 0
+            lastCountedSample = nil
+            recoveryStartedAt = nil
+            return true
+        }
+        return false
+    }
+
+    static func sampleIsFresh(_ sampleAt: Date, now: Date, maximumAge: TimeInterval = 4) -> Bool {
+        let age = now.timeIntervalSince(sampleAt)
+        return age >= -1 && age <= maximumAge
+    }
+
+    static func sensorsAreSafe(cpuFresh: Bool, powerFresh: Bool,
+                               thermal: ThermalLevel, cpuTemperatureC: Double?) -> Bool {
+        cpuFresh && powerFresh && thermal != .critical && thermal != .unknown &&
+            cpuTemperatureC.map { $0.isFinite && $0 > 0 && $0 < 75 } == true
+    }
+
+    static func heartbeatIsDue(lastSentAt: Date, now: Date, interval: TimeInterval = 10) -> Bool {
+        now.timeIntervalSince(lastSentAt) >= interval
     }
 }

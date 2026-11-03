@@ -1,7 +1,10 @@
 import AppKit
 
 private func check(_ value: @autoclosure () -> Bool, _ message: String) {
-    if !value() { fatalError("FAILED: \(message)") }
+    if !value() {
+        fputs("FAILED: \(message)\n", stderr)
+        fatalError("FAILED: \(message)")
+    }
 }
 
 @main
@@ -108,7 +111,7 @@ enum ApexTunePolicyTests {
                 let profile = ProfilePolicy.fixedProfile(pl1: pl1, tier: tier,
                                                          baselinePL1: 100, baselinePL2: 125)
                 check(profile?.pl1 == pl1 && profile?.tier == tier,
-                      "all 15 PL1 levels and five tiers are supported")
+                      "all 15 PL1 levels and five tiers are supported: requested \(pl1)/\(tier), got \(String(describing: profile))")
                 let mappedPL2 = min(80, pl1 + (tier - 1) * 5)
                 check(profile?.pl2 == mappedPL2 && mappedPL2 <= 80 && mappedPL2 >= pl1,
                       "PL2 tier is bounded")
@@ -192,6 +195,45 @@ enum ApexTunePolicyTests {
         check(ProfilePolicy.proposal(for: frame(load: 0.5, temp: nil, watts: nil), requirePower: true) == nil,
               "control proposal requires real power and temperature sensors")
 
+        let fallbackProfile = SensorFallbackRecovery.safeProfile
+        check(fallbackProfile == Profile(pl1: 10, tier: 1, pl2: 10),
+              "startup and sensor degradation use bounded 10/10 W profile")
+        var fallbackRecovery = SensorFallbackRecovery()
+        let fallbackStart = Date(timeIntervalSince1970: 1_800_000_100)
+        check(!fallbackRecovery.observe(isSafe: false, sampleAt: nil),
+              "missing sensors remain in safe fallback")
+        for second in 0...10 {
+            let sampleAt = fallbackStart.addingTimeInterval(Double(second))
+            let recovered = fallbackRecovery.observe(isSafe: true, sampleAt: sampleAt)
+            if second == 4 {
+                check(!recovered && fallbackRecovery.isDegraded,
+                      "five safe samples alone do not leave fallback before the 10-second dwell")
+            }
+            if second < 10 {
+                check(!recovered, "recovery waits for stable fresh CPU and power samples")
+            } else {
+                check(recovered && !fallbackRecovery.isDegraded,
+                      "ten seconds of five or more fresh safe samples permit gradual recovery")
+            }
+        }
+        fallbackRecovery.observe(isSafe: false, sampleAt: nil)
+        check(fallbackRecovery.isDegraded && fallbackRecovery.consecutiveFreshSamples == 0,
+              "critical or missing sensor resets recovery dwell to 10/10 fallback")
+        check(!SensorFallbackRecovery.sampleIsFresh(fallbackStart, now: fallbackStart.addingTimeInterval(5)),
+              "a sensor sample older than four seconds is unavailable")
+        check(SensorFallbackRecovery.sampleIsFresh(fallbackStart.addingTimeInterval(1),
+              now: fallbackStart.addingTimeInterval(1)),
+              "fresh CPU tick is checked after the current sample timestamp is recorded")
+        check(SensorFallbackRecovery.heartbeatIsDue(lastSentAt: fallbackStart,
+              now: fallbackStart.addingTimeInterval(10)),
+              "sensor fallback continues due heartbeats while readings are unavailable")
+        check(!SensorFallbackRecovery.sensorsAreSafe(cpuFresh: true, powerFresh: true,
+              thermal: .critical, cpuTemperatureC: 60),
+              "critical thermal input keeps the live controller in 10/10 fallback")
+        check(!SensorFallbackRecovery.sensorsAreSafe(cpuFresh: true, powerFresh: true,
+              thermal: .nominal, cpuTemperatureC: 75),
+              "recovery requires CPU die temperature below 75 C")
+
         var parser = PowerMetricsParser()
         let first = """
         *** Sampled system activity (Mon Nov 2 23:08:42 2026 +0300) (1008.68ms elapsed) ***
@@ -222,25 +264,26 @@ enum ApexTunePolicyTests {
         let large = Profile(pl1: 80, tier: 5, pl2: 80)
         var hysteresis = ProfileHysteresis()
         hysteresis.confirmApplied(small, at: t0)
-        let firstStep = hysteresis.observe(large, now: t0.addingTimeInterval(1))
-        check(firstStep?.pl1 == 20 && firstStep?.pl2 == 20,
-              "upward response starts promptly with a bounded step")
+        check(hysteresis.observe(large, now: t0.addingTimeInterval(2)) == nil,
+              "upward response waits three seconds between confirmed steps")
+        let firstStep = hysteresis.observe(large, now: t0.addingTimeInterval(3))!
+        check(firstStep.pl1 == 15 && firstStep.pl2 == 15,
+              "first upward step is limited to 5 W for both limits")
         check(hysteresis.applied == small, "an unacknowledged candidate never changes applied state")
-        check(hysteresis.observe(large, now: t0.addingTimeInterval(2)) == firstStep,
-              "pending upward candidate is stable until acknowledged")
-        hysteresis.confirmApplied(firstStep!, at: t0.addingTimeInterval(2))
-        let secondStep = hysteresis.observe(large, now: t0.addingTimeInterval(3))
-        check(secondStep?.pl1 == 30 && secondStep!.pl1 - firstStep!.pl1 <= 10 &&
-              secondStep!.pl2 - firstStep!.pl2 <= 10,
-              "successive upward steps are bounded to 10 W")
+        hysteresis.confirmApplied(firstStep, at: t0.addingTimeInterval(3))
+        check(hysteresis.observe(large, now: t0.addingTimeInterval(5)) == nil,
+              "acknowledged increases still wait for the full three-second interval")
+        let secondStep = hysteresis.observe(large, now: t0.addingTimeInterval(6))!
+        check(secondStep.pl1 - firstStep.pl1 <= 5 && secondStep.pl2 - firstStep.pl2 <= 5,
+              "successive PL1 and PL2 increases are bounded to 5 W")
         check(hysteresis.applied == firstStep, "second candidate awaits its own acknowledgement")
 
-        hysteresis.confirmApplied(large, at: t0.addingTimeInterval(3))
-        for second in 4...8 {
+        hysteresis.confirmApplied(large, at: t0.addingTimeInterval(6))
+        for second in 7...11 {
             check(hysteresis.observe(small, now: t0.addingTimeInterval(Double(second))) == nil,
                   "routine downshift waits for five consistent samples and five seconds")
         }
-        check(hysteresis.observe(small, now: t0.addingTimeInterval(9)) == small,
+        check(hysteresis.observe(small, now: t0.addingTimeInterval(12)) == small,
               "routine downshift becomes eligible after five seconds")
         check(hysteresis.applied == large, "downshift remains proposed until confirmed")
 
@@ -261,10 +304,9 @@ enum ApexTunePolicyTests {
 
         var lifecycle = ControllerLifecycle()
         lifecycle.begin(originalPL1: 100, originalPL2: 125)
-        lifecycle.sensorSeen(at: t0)
-        check(!lifecycle.shouldRelease(now: t0.addingTimeInterval(3), thermal: .nominal), "fresh sensors retain session")
-        check(lifecycle.shouldRelease(now: t0.addingTimeInterval(5), thermal: .nominal), "stale sensors release session")
-        check(lifecycle.shouldRelease(now: t0, thermal: .critical), "critical thermal releases immediately")
+        lifecycle.applyConfirmed(fallbackProfile)
+        check(lifecycle.isActive && lifecycle.applied == fallbackProfile,
+              "sensor fallback retains the active control lease and confirmed 10/10 W profile")
         lifecycle.restored()
         check(!lifecycle.isActive && lifecycle.applied == nil, "restore returns lifecycle to observe mode")
 
@@ -282,7 +324,7 @@ enum ApexTunePolicyTests {
 
         var failedAck = ProfileHysteresis()
         failedAck.confirmApplied(small, at: t0)
-        let failedCandidate = failedAck.observe(large, now: t0.addingTimeInterval(1))!
+        let failedCandidate = failedAck.observe(large, now: t0.addingTimeInterval(3))!
         var rejectingMock = MockProbe(originalPL1: 100, originalPL2: 125, rejectSet: true)
         rejectingMock.begin()
         check(!rejectingMock.set(failedCandidate) && failedAck.applied == small,
